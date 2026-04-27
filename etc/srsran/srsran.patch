@@ -1,0 +1,818 @@
+diff --git a/apps/gnb/gnb_appconfig_translators.cpp b/apps/gnb/gnb_appconfig_translators.cpp
+index 4474f1110..49f4de9d6 100644
+--- a/apps/gnb/gnb_appconfig_translators.cpp
++++ b/apps/gnb/gnb_appconfig_translators.cpp
+@@ -927,6 +927,9 @@ static void generate_low_phy_config(lower_phy_configuration&     out_cfg,
+       band_helper::nr_arfcn_to_freq(band_helper::get_ul_arfcn_from_dl_arfcn(cell_cfg.dl_arfcn, cell_cfg.band));
+   sector_config.nof_rx_ports = cell_cfg.nof_antennas_ul;
+   sector_config.nof_tx_ports = cell_cfg.nof_antennas_dl;
++  if (band_helper::get_duplex_mode(*cell_cfg.band) == duplex_mode::TDD) {
++    sector_config.tdd_config.emplace(generate_tdd_pattern(cell_cfg.common_scs, cell_cfg.tdd_ul_dl_cfg.value()));
++  }
+   out_cfg.sectors.push_back(sector_config);
+ 
+   if (!is_valid_lower_phy_config(out_cfg)) {
+diff --git a/include/srsran/gateways/baseband/baseband_gateway_transmitter.h b/include/srsran/gateways/baseband/baseband_gateway_transmitter.h
+index 6c3477486..8492cbaa3 100644
+--- a/include/srsran/gateways/baseband/baseband_gateway_transmitter.h
++++ b/include/srsran/gateways/baseband/baseband_gateway_transmitter.h
+@@ -21,6 +21,7 @@
+  */
+ 
+ #pragma once
++#include "srsran/adt/optional.h"
+ #include "srsran/gateways/baseband/baseband_gateway_base.h"
+ #include "srsran/gateways/baseband/baseband_gateway_timestamp.h"
+ 
+@@ -36,6 +37,8 @@ public:
+   struct metadata {
+     /// Baseband transmitter timestamp. Indicates the time the data needs to be transmitted at.
+     baseband_gateway_timestamp ts;
++    optional<baseband_gateway_timestamp> start;
++    optional<baseband_gateway_timestamp> stop;
+   };
+ 
+   /// \brief Transmits a set of baseband samples at the time instant provided in the metadata.
+@@ -45,4 +48,4 @@ public:
+   virtual void transmit(const baseband_gateway_buffer_reader& data, const metadata& metadata) = 0;
+ };
+ 
+-} // namespace srsran
+\ No newline at end of file
++} // namespace srsran
+diff --git a/include/srsran/phy/lower/lower_phy_configuration.h b/include/srsran/phy/lower/lower_phy_configuration.h
+index 10830f752..a7c5d22c2 100644
+--- a/include/srsran/phy/lower/lower_phy_configuration.h
++++ b/include/srsran/phy/lower/lower_phy_configuration.h
+@@ -34,6 +34,7 @@
+ #include "srsran/ran/cyclic_prefix.h"
+ #include "srsran/ran/n_ta_offset.h"
+ #include "srsran/ran/subcarrier_spacing.h"
++#include "srsran/ran/tdd/tdd_ul_dl_config.h"
+ #include "srsran/support/executors/task_executor.h"
+ 
+ namespace srsran {
+@@ -50,6 +51,8 @@ struct lower_phy_sector_description {
+   unsigned nof_tx_ports;
+   /// Number of receive ports.
+   unsigned nof_rx_ports;
++  /// TDD Configuration
++  optional<tdd_ul_dl_config_common> tdd_config;
+ };
+ 
+ /// \brief Lower physical layer baseband gateway buffer size policy.
+diff --git a/include/srsran/phy/lower/processors/downlink/downlink_processor_baseband.h b/include/srsran/phy/lower/processors/downlink/downlink_processor_baseband.h
+index 55ad4c89c..fa99a52bc 100644
+--- a/include/srsran/phy/lower/processors/downlink/downlink_processor_baseband.h
++++ b/include/srsran/phy/lower/processors/downlink/downlink_processor_baseband.h
+@@ -23,6 +23,7 @@
+ #pragma once
+ 
+ #include "srsran/adt/complex.h"
++#include "srsran/adt/optional.h"
+ #include "srsran/adt/span.h"
+ #include "srsran/gateways/baseband/baseband_gateway_timestamp.h"
+ 
+@@ -43,8 +44,15 @@ public:
+   ///
+   /// \param[in] buffer    Baseband samples to process.
+   /// \param[in] timestamp Time instant in which the first sample in the buffer is transmitted.
++  /// \param[out] start    -1 if there is no need to start the TX, otherwise
++  ///                       the timestamp to start the radio at.
++  /// \param[out] stop     -1 if there is no need to stop the TX, otherwise
++  ///                       the timestamp to stop the radio at.
+   /// \remark The number of channels in \c buffer must be equal to the number of transmit ports for the sector.
+-  virtual void process(baseband_gateway_buffer_writer& buffer, baseband_gateway_timestamp timestamp) = 0;
++  virtual void process(baseband_gateway_buffer_writer&       buffer,
++                       baseband_gateway_timestamp            timestamp,
++                       optional<baseband_gateway_timestamp>& start,
++                       optional<baseband_gateway_timestamp>& stop) = 0;
+ };
+ 
+ } // namespace srsran
+diff --git a/include/srsran/phy/lower/processors/downlink/downlink_processor_factories.h b/include/srsran/phy/lower/processors/downlink/downlink_processor_factories.h
+index 095648025..87bab997b 100644
+--- a/include/srsran/phy/lower/processors/downlink/downlink_processor_factories.h
++++ b/include/srsran/phy/lower/processors/downlink/downlink_processor_factories.h
+@@ -26,6 +26,7 @@
+ #include "srsran/phy/lower/processors/downlink/downlink_processor.h"
+ #include "srsran/phy/lower/processors/downlink/pdxch/pdxch_processor_factories.h"
+ #include "srsran/phy/lower/sampling_rate.h"
++#include "srsran/ran/tdd/tdd_ul_dl_config.h"
+ #include <memory>
+ 
+ namespace srsran {
+@@ -40,6 +41,8 @@ struct downlink_processor_configuration {
+   cyclic_prefix cp;
+   /// Baseband sampling rate.
+   sampling_rate rate;
++  /// TDD Config
++  optional<tdd_ul_dl_config_common> tdd_config;
+   /// Bandwidth in PRB.
+   unsigned bandwidth_prb;
+   /// Center frequency in Hz.
+@@ -68,4 +71,4 @@ std::shared_ptr<lower_phy_downlink_processor_factory>
+ create_downlink_processor_factory_sw(std::shared_ptr<pdxch_processor_factory>      pdxch_proc_factory,
+                                      std::shared_ptr<amplitude_controller_factory> amplitude_control_factory);
+ 
+-} // namespace srsran
+\ No newline at end of file
++} // namespace srsran
+diff --git a/include/srsran/ran/tdd/tdd_ul_dl_config.h b/include/srsran/ran/tdd/tdd_ul_dl_config.h
+index 44bfdfa48..80609815b 100644
+--- a/include/srsran/ran/tdd/tdd_ul_dl_config.h
++++ b/include/srsran/ran/tdd/tdd_ul_dl_config.h
+@@ -83,4 +83,10 @@ optional<unsigned> find_next_tdd_ul_slot(const tdd_ul_dl_config_common& cfg, uns
+ /// \brief Finds the next TDD slot index with all UL symbols, starting from the given slot index.
+ optional<unsigned> find_next_tdd_full_ul_slot(const tdd_ul_dl_config_common& cfg, unsigned start_slot_index = 0);
+ 
++/// \brief Determines if this is the last DL symbol in this period
++bool is_last_tdd_dl_symbol(const tdd_ul_dl_config_common& cfg,
++                           unsigned slot_index,
++                           unsigned symbol_index,
++                           cyclic_prefix cp);
++
+ } // namespace srsran
+diff --git a/lib/phy/lower/lower_phy_baseband_processor.cpp b/lib/phy/lower/lower_phy_baseband_processor.cpp
+index 9bcb5b438..0a83102cc 100644
+--- a/lib/phy/lower/lower_phy_baseband_processor.cpp
++++ b/lib/phy/lower/lower_phy_baseband_processor.cpp
+@@ -95,6 +95,9 @@ void lower_phy_baseband_processor::stop()
+ 
+ void lower_phy_baseband_processor::dl_process(baseband_gateway_timestamp timestamp)
+ {
++  optional<baseband_gateway_timestamp> start;
++  optional<baseband_gateway_timestamp> stop;
++
+   // Check if it is running, notify stop and return without enqueueing more tasks.
+   if (!tx_state.is_running()) {
+     tx_state.notify_stop();
+@@ -126,13 +129,19 @@ void lower_phy_baseband_processor::dl_process(baseband_gateway_timestamp timesta
+   last_tx_time.emplace(std::chrono::high_resolution_clock::now());
+ 
+   // Process downlink buffer.
+-  downlink_processor.process(dl_buffer->get_writer(), timestamp);
++  downlink_processor.process(dl_buffer->get_writer(), timestamp, start, stop);
+ 
+   // Enqueue transmission.
+-  tx_executor.execute([this, timestamp, tx_buffer = std::move(dl_buffer)]() mutable {
++  tx_executor.execute([this, timestamp, start, stop, tx_buffer = std::move(dl_buffer)]() mutable {
+     // Prepare transmit metadata.
+     baseband_gateway_transmitter::metadata tx_metadata;
+     tx_metadata.ts = timestamp + tx_time_offset;
++    if(start) {
++      tx_metadata.start = *start + tx_time_offset;
++    }
++    if(stop) {
++      tx_metadata.stop = *stop + tx_time_offset;
++    }
+ 
+     // Transmit buffer.
+     transmitter.transmit(tx_buffer->get_reader(), tx_metadata);
+diff --git a/lib/phy/lower/lower_phy_baseband_processor.h b/lib/phy/lower/lower_phy_baseband_processor.h
+index ce4508f1b..81c5da84a 100644
+--- a/lib/phy/lower/lower_phy_baseband_processor.h
++++ b/lib/phy/lower/lower_phy_baseband_processor.h
+@@ -218,4 +218,4 @@ private:
+   optional<std::chrono::time_point<std::chrono::high_resolution_clock>> last_tx_time;
+ };
+ 
+-} // namespace srsran
+\ No newline at end of file
++} // namespace srsran
+diff --git a/lib/phy/lower/lower_phy_factory.cpp b/lib/phy/lower/lower_phy_factory.cpp
+index 914fd649b..06e3a57db 100644
+--- a/lib/phy/lower/lower_phy_factory.cpp
++++ b/lib/phy/lower/lower_phy_factory.cpp
+@@ -138,6 +138,7 @@ public:
+     dl_proc_config.scs                     = config.scs;
+     dl_proc_config.cp                      = config.cp;
+     dl_proc_config.rate                    = config.srate;
++    dl_proc_config.tdd_config              = config.sectors.back().tdd_config;
+     dl_proc_config.bandwidth_prb           = sector.bandwidth_rb;
+     dl_proc_config.center_frequency_Hz     = sector.dl_freq_hz;
+     dl_proc_config.nof_tx_ports            = sector.nof_tx_ports;
+diff --git a/lib/phy/lower/processors/downlink/CMakeLists.txt b/lib/phy/lower/processors/downlink/CMakeLists.txt
+index 6339f0149..42ef8d939 100644
+--- a/lib/phy/lower/processors/downlink/CMakeLists.txt
++++ b/lib/phy/lower/processors/downlink/CMakeLists.txt
+@@ -23,4 +23,6 @@ add_subdirectory(pdxch)
+ add_library(srsran_lower_phy_downlink_processor STATIC
+         downlink_processor_baseband_impl.cpp
+         downlink_processor_factories.cpp
+-        downlink_processor_impl.cpp)
+\ No newline at end of file
++        downlink_processor_impl.cpp)
++target_link_libraries(srsran_lower_phy_downlink_processor
++        srsran_ran)
+diff --git a/lib/phy/lower/processors/downlink/downlink_processor_baseband_impl.cpp b/lib/phy/lower/processors/downlink/downlink_processor_baseband_impl.cpp
+index 69b26b593..c8a5345c2 100644
+--- a/lib/phy/lower/processors/downlink/downlink_processor_baseband_impl.cpp
++++ b/lib/phy/lower/processors/downlink/downlink_processor_baseband_impl.cpp
+@@ -35,6 +35,7 @@ downlink_processor_baseband_impl::downlink_processor_baseband_impl(
+   nof_slot_tti_in_advance(config.nof_slot_tti_in_advance),
+   sector_id(config.sector_id),
+   scs(config.scs),
++  tdd_config(config.tdd_config),
+   nof_rx_ports(config.nof_tx_ports),
+   nof_samples_per_subframe(config.rate.to_kHz()),
+   nof_slots_per_subframe(get_nof_slots_per_subframe(config.scs)),
+@@ -45,6 +46,10 @@ downlink_processor_baseband_impl::downlink_processor_baseband_impl(
+   unsigned symbol_size_no_cp        = config.rate.get_dft_size(config.scs);
+   unsigned nof_symbols_per_subframe = nof_symbols_per_slot * nof_slots_per_subframe;
+ 
++  if(tdd_config) {
++    fmt::print("TDD Config {}\n", tdd_config->pattern1.nof_dl_slots);
++  }
++
+   // Setup symbol sizes.
+   symbol_sizes.reserve(nof_symbols_per_subframe);
+   for (unsigned i_symbol = 0; i_symbol != nof_symbols_per_subframe; ++i_symbol) {
+@@ -56,12 +61,21 @@ downlink_processor_baseband_impl::downlink_processor_baseband_impl(
+   temp_buffer_read_index = temp_buffer.get_nof_samples();
+ }
+ 
+-void downlink_processor_baseband_impl::process(baseband_gateway_buffer_writer& buffer,
+-                                               baseband_gateway_timestamp      timestamp)
++void downlink_processor_baseband_impl::process(
++    baseband_gateway_buffer_writer&       buffer,
++    baseband_gateway_timestamp            timestamp,
++    optional<baseband_gateway_timestamp>& start_time,
++    optional<baseband_gateway_timestamp>& stop_time)
+ {
+   srsran_assert(nof_rx_ports == buffer.get_nof_channels(), "Invalid number of channels.");
+   unsigned nof_output_samples    = buffer.get_nof_samples();
+   unsigned nof_processed_samples = 0;
++  bool active_dl;
++  bool last_dl_symbol;
++
++  start_time.reset();
++  stop_time = hold_stop_time;
++  hold_stop_time.reset();
+ 
+   // Process all the input samples.
+   while (nof_processed_samples < nof_output_samples) {
+@@ -70,8 +84,23 @@ void downlink_processor_baseband_impl::process(baseband_gateway_buffer_writer& b
+     // If there are no more samples available in the temporary buffer, process a new symbol and update current symbol
+     // size.
+     if (current_symbol_size == temp_buffer_read_index) {
+-      process_new_symbol(timestamp + nof_processed_samples);
++      process_new_symbol(timestamp + nof_processed_samples,
++                         active_dl, last_dl_symbol);
+       current_symbol_size = temp_buffer.get_nof_samples();
++
++      if(!downlink_active && active_dl) {
++        srsran_assert(!start_time,
++                      "Multiple Start of Bursts not implemented yet.");
++        start_time = timestamp + nof_processed_samples;
++        downlink_active = true;
++      }
++
++      if(last_dl_symbol) {
++        srsran_assert(!stop_time,
++                     "Multiple End of Bursts not implemented yet.");
++        stop_time = timestamp + nof_processed_samples + current_symbol_size;
++        downlink_active = false;
++      }
+     }
+ 
+     // Select the minimum among the remainder of samples to process and the number of samples to complete the buffer.
+@@ -93,9 +122,19 @@ void downlink_processor_baseband_impl::process(baseband_gateway_buffer_writer& b
+     temp_buffer_read_index += count;
+     nof_processed_samples += count;
+   }
++
++  // If stop_time is past the end of the buffer the caller doesn't need to know
++  // about it yet (unless stop time is exactly on the next sample).
++  if(stop_time && *stop_time > timestamp + nof_processed_samples) {
++    hold_stop_time = stop_time;
++    stop_time.reset();
++  }
+ }
+ 
+-void downlink_processor_baseband_impl::process_new_symbol(baseband_gateway_timestamp timestamp)
++void downlink_processor_baseband_impl::process_new_symbol(
++    baseband_gateway_timestamp timestamp,
++    bool&                      active_downlink,
++    bool&                      last_downlink_symbol)
+ {
+   // Calculate the subframe index.
+   unsigned i_sf = timestamp / nof_samples_per_subframe;
+@@ -198,4 +237,16 @@ void downlink_processor_baseband_impl::process_new_symbol(baseband_gateway_times
+       symbol_papr.reset();
+     }
+   }
+-}
+\ No newline at end of file
++
++  if(tdd_config) { // TDD or FDD?
++    auto active_dl_symbols = get_active_tdd_dl_symbols(*tdd_config,
++                                                       i_slot, cp);
++    active_downlink = active_dl_symbols.start() <= i_symbol &&
++                        i_symbol < active_dl_symbols.stop();
++    last_downlink_symbol = is_last_tdd_dl_symbol(*tdd_config,
++                                                 i_slot, i_symbol, cp);
++  } else {
++    active_downlink = true;
++    last_downlink_symbol = false;
++  }
++}
+diff --git a/lib/phy/lower/processors/downlink/downlink_processor_baseband_impl.h b/lib/phy/lower/processors/downlink/downlink_processor_baseband_impl.h
+index e204c6918..a8b869e74 100644
+--- a/lib/phy/lower/processors/downlink/downlink_processor_baseband_impl.h
++++ b/lib/phy/lower/processors/downlink/downlink_processor_baseband_impl.h
+@@ -31,6 +31,7 @@
+ #include "srsran/phy/lower/processors/downlink/pdxch/pdxch_processor_baseband.h"
+ #include "srsran/phy/lower/sampling_rate.h"
+ #include "srsran/ran/cyclic_prefix.h"
++#include "srsran/ran/tdd/tdd_ul_dl_config.h"
+ #include "srsran/support/stats.h"
+ 
+ namespace srsran {
+@@ -45,6 +46,8 @@ struct downlink_processor_baseband_configuration {
+   cyclic_prefix cp;
+   /// Baseband sampling rate.
+   sampling_rate rate;
++  /// TDD Config
++  optional<tdd_ul_dl_config_common> tdd_config;
+   /// Number of transmit ports.
+   unsigned nof_tx_ports;
+   /// Number of slots notified in advance in the TTI boundary event.
+@@ -69,11 +72,16 @@ public:
+   void connect(downlink_processor_notifier& notifier_) { notifier = &notifier_; }
+ 
+   // See interface for documentation.
+-  void process(baseband_gateway_buffer_writer& buffer, baseband_gateway_timestamp timestamp) override;
++  void process(baseband_gateway_buffer_writer& buffer,
++               baseband_gateway_timestamp timestamp,
++               optional<baseband_gateway_timestamp>& start,
++               optional<baseband_gateway_timestamp>& stop) override;
+ 
+ private:
+-  /// Processes a new symbol.
+-  void process_new_symbol(baseband_gateway_timestamp timestamp);
++  /// Processes a new symbol. Return true if last symbol in downlink.
++  void process_new_symbol(baseband_gateway_timestamp timestamp,
++                          bool& active_downlink,
++                          bool& last_downlink_symbol);
+ 
+   /// Logger for printing amplitude control.
+   srslog::basic_logger& amplitude_control_logger;
+@@ -87,6 +95,10 @@ private:
+   unsigned sector_id;
+   /// Subcarrier spacing.
+   subcarrier_spacing scs;
++  /// Cyclic prefix configuration.
++  cyclic_prefix cp;
++  /// TDD Config
++  optional<tdd_ul_dl_config_common> tdd_config;
+   /// Number of receive ports.
+   unsigned nof_rx_ports;
+   /// Number of samples per subframe;
+@@ -112,6 +124,11 @@ private:
+   sample_statistics<float> peak_symbol_power;
+   /// Symbol PAPR statistics.
+   sample_statistics<float> symbol_papr;
++
++  /// Was the last symbol an active downlink (start of burst handling)
++  bool downlink_active = false;
++  /// An end of burst that's still in the temp_buffer
++  optional<baseband_gateway_timestamp> hold_stop_time;
+ };
+ 
+ } // namespace srsran
+diff --git a/lib/phy/lower/processors/downlink/downlink_processor_factories.cpp b/lib/phy/lower/processors/downlink/downlink_processor_factories.cpp
+index 6e60e3a96..05779b7d4 100644
+--- a/lib/phy/lower/processors/downlink/downlink_processor_factories.cpp
++++ b/lib/phy/lower/processors/downlink/downlink_processor_factories.cpp
+@@ -56,6 +56,7 @@ public:
+     baseband_config.scs                     = config.scs;
+     baseband_config.cp                      = config.cp;
+     baseband_config.rate                    = config.rate;
++    baseband_config.tdd_config              = config.tdd_config;
+     baseband_config.nof_tx_ports            = config.nof_tx_ports;
+     baseband_config.nof_slot_tti_in_advance = config.nof_slot_tti_in_advance;
+     baseband_config.logger                  = config.logger;
+@@ -77,4 +78,4 @@ srsran::create_downlink_processor_factory_sw(std::shared_ptr<pdxch_processor_fac
+ {
+   return std::make_shared<lower_phy_downlink_processor_factory_sw>(std::move(pdxch_proc_factory),
+                                                                    std::move(amplitude_control_factory));
+-}
+\ No newline at end of file
++}
+diff --git a/lib/radio/uhd/radio_uhd_device.h b/lib/radio/uhd/radio_uhd_device.h
+index df77ab7be..1f94993c5 100644
+--- a/lib/radio/uhd/radio_uhd_device.h
++++ b/lib/radio/uhd/radio_uhd_device.h
+@@ -153,7 +153,23 @@ public:
+ 
+     fmt::print("Making USRP object with args '{}'\n", device_addr.to_string());
+ 
+-    return safe_execution([this, &device_addr]() { usrp = uhd::usrp::multi_usrp::make(device_addr); });
++    return safe_execution([this, &device_addr]() {
++		    usrp = uhd::usrp::multi_usrp::make(device_addr);
++		    fmt::print("Setting GPIO for RF front end.\n");
++		    // Set GPIO for RF front end
++		    // setup GPIO for TDD, GPIO(4) = ATR_RX
++		    //set lower 7 bits to be controlled automatically by ATR (the rest 5 bits are controlled manually)
++		    usrp->set_gpio_attr("FP0", "CTRL", 0x7f, 0xff);
++		    // set data direction register (DDR) to output
++		    usrp->set_gpio_attr("FP0", "DDR", 0xff, 0xff);
++		    //set pins 4 (RX_TX_Switch) and 6 (Shutdown PA) to 1 when the radio is only receiving (ATR_RX)
++		    usrp->set_gpio_attr("FP0", "ATR_RX", (1<<4)|(1<<6), 0x7f);
++		    // set pin 5 (Shutdown LNA) to 1 when the radio is transmitting and receiveing (ATR_XX)
++		    // (we use full duplex here, because our RX is on all the time - this might need to change later)
++		    usrp->set_gpio_attr("FP0", "ATR_XX", (1<<5), 0x7f);
++		    // set the output pins to 1
++		    usrp->set_gpio_attr("FP0", "OUT", 1<<7, 0x80);
++		    });
+   }
+   bool is_connection_valid()
+   {
+diff --git a/lib/radio/uhd/radio_uhd_tx_stream.cpp b/lib/radio/uhd/radio_uhd_tx_stream.cpp
+index 31f1e75a0..644c79a49 100644
+--- a/lib/radio/uhd/radio_uhd_tx_stream.cpp
++++ b/lib/radio/uhd/radio_uhd_tx_stream.cpp
+@@ -21,6 +21,7 @@
+  */
+ 
+ #include "radio_uhd_tx_stream.h"
++#include "srsran/adt/optional.h"
+ 
+ using namespace srsran;
+ 
+@@ -95,10 +96,11 @@ void radio_uhd_tx_stream::run_recv_async_msg()
+   }
+ }
+ 
+-bool radio_uhd_tx_stream::transmit_block(unsigned&                             nof_txd_samples,
+-                                         const baseband_gateway_buffer_reader& buffs,
+-                                         unsigned                              buffer_offset,
+-                                         uhd::time_spec_t&                     time_spec)
++bool radio_uhd_tx_stream::transmit_block(
++    unsigned&                             nof_txd_samples,
++    const baseband_gateway_buffer_reader& buffs,
++    unsigned                              buffer_offset,
++    uhd::time_spec_t&                     time_spec)
+ {
+   // Prepare metadata.
+   uhd::tx_metadata_t md = {};
+@@ -110,7 +112,7 @@ bool radio_uhd_tx_stream::transmit_block(unsigned&                             n
+   report_fatal_error_if_not(buffs.get_nof_channels() == nof_channels, "Number of channels does not match.");
+ 
+   // Run states.
+-  if (!state_fsm.transmit_block(md, time_spec)) {
++  if (!state_fsm.transmit_block(md, time_spec, num_samples)) {
+     nof_txd_samples = num_samples;
+     return true;
+   }
+@@ -197,8 +199,9 @@ radio_uhd_tx_stream::radio_uhd_tx_stream(uhd::usrp::multi_usrp::sptr& usrp,
+   run_recv_async_msg();
+ }
+ 
+-void radio_uhd_tx_stream::transmit(const baseband_gateway_buffer_reader&         data,
+-                                   const baseband_gateway_transmitter::metadata& tx_md)
++void radio_uhd_tx_stream::transmit(
++    const baseband_gateway_buffer_reader&         data,
++    const baseband_gateway_transmitter::metadata& tx_md)
+ {
+   // Protect stream transmitter.
+   std::unique_lock<std::mutex> lock(stream_transmit_mutex);
+@@ -208,6 +211,13 @@ void radio_uhd_tx_stream::transmit(const baseband_gateway_buffer_reader&
+   unsigned nsamples          = data.get_nof_samples();
+   unsigned txd_samples_total = 0;
+ 
++  if(tx_md.start) {
++    state_fsm.queue_start_of_burst(*tx_md.start-tx_md.ts);
++  }
++  if(tx_md.stop) {
++    state_fsm.queue_end_of_burst(*tx_md.stop-tx_md.ts);
++  }
++
+   // Receive stream in multiple blocks.
+   while (txd_samples_total < nsamples) {
+     unsigned txd_samples = 0;
+@@ -217,7 +227,7 @@ void radio_uhd_tx_stream::transmit(const baseband_gateway_buffer_reader&
+     }
+ 
+     // Save timespec for first block.
+-    time_spec += txd_samples * srate_hz;
++    time_spec += txd_samples / srate_hz;
+ 
+     // Increment the total amount of received samples.
+     txd_samples_total += txd_samples;
+@@ -267,4 +277,4 @@ void radio_uhd_tx_stream::wait_stop()
+ unsigned radio_uhd_tx_stream::get_buffer_size() const
+ {
+   return max_packet_size;
+-}
+\ No newline at end of file
++}
+diff --git a/lib/radio/uhd/radio_uhd_tx_stream.h b/lib/radio/uhd/radio_uhd_tx_stream.h
+index f7fc18862..1f41cd7e4 100644
+--- a/lib/radio/uhd/radio_uhd_tx_stream.h
++++ b/lib/radio/uhd/radio_uhd_tx_stream.h
+@@ -41,7 +41,7 @@ private:
+   /// Receive asynchronous message timeout in seconds.
+   static constexpr double RECV_ASYNC_MSG_TIMEOUT_S = 0.001;
+   /// Transmit timeout in seconds.
+-  static constexpr double TRANSMIT_TIMEOUT_S = 0.001;
++  static constexpr double TRANSMIT_TIMEOUT_S = 0.002;
+ 
+   /// Indicates the stream identification for notifications.
+   unsigned stream_id;
+diff --git a/lib/radio/uhd/radio_uhd_tx_stream_fsm.h b/lib/radio/uhd/radio_uhd_tx_stream_fsm.h
+index 9305bf04e..3633fda9e 100644
+--- a/lib/radio/uhd/radio_uhd_tx_stream_fsm.h
++++ b/lib/radio/uhd/radio_uhd_tx_stream_fsm.h
+@@ -22,6 +22,8 @@
+ 
+ #pragma once
+ 
++#include "srsran/adt/optional.h"
++
+ #include <condition_variable>
+ #include <mutex>
+ 
+@@ -52,9 +54,13 @@ private:
+     /// Indicates the stream is transmitting a burst.
+     IN_BURST,
+     /// Indicates an end-of-burst must be transmitted and abort any transmission.
+-    END_OF_BURST,
+-    /// Indicates wait for end-of-burst acknowledgement.
++    UNDERFLOW_RECOVERY,
++    /// Indicates wait for end-of-burst acknowledgement. Used when recovering
++    /// from an underflow.
+     WAIT_END_OF_BURST,
++    // TODO: Figure out how this sob/eob meshes w/ handling underflow
++    /// State that we're in while not transmitting a burst.
++    IDLE,
+     /// Signals a stop to the asynchronous thread.
+     WAIT_STOP,
+     /// Indicates the asynchronous thread is notify_stop.
+@@ -64,6 +70,12 @@ private:
+   /// Indicates the current state.
+   states state;
+ 
++  // TODO: It would be better to do this with vectors
++  /// Samples remaining until start of the burst
++  optional<unsigned> start_of_burst;
++  /// Samples remaining until of this burst (used to calculated eob)
++  optional<unsigned> end_of_burst;
++
+   /// Protects the class concurrent access.
+   mutable std::mutex mutex;
+   /// Condition variable to wait for certain states.
+@@ -76,7 +88,7 @@ public:
+   void init_successful()
+   {
+     std::unique_lock<std::mutex> lock(mutex);
+-    state = states::START_BURST;
++    state = states::IDLE;
+   }
+ 
+   /// \brief Notifies a late or an underflow event.
+@@ -85,8 +97,11 @@ public:
+   void async_event_late_underflow(const uhd::time_spec_t& time_spec)
+   {
+     std::unique_lock<std::mutex> lock(mutex);
++    // TODO: Handle FDD
++    start_of_burst.reset();
++    end_of_burst.reset();
+     if (state == states::IN_BURST) {
+-      state            = states::END_OF_BURST;
++      state            = states::UNDERFLOW_RECOVERY;
+       wait_eob_timeout = time_spec;
+       wait_eob_timeout += WAIT_EOB_ACK_TIMEOUT_S;
+     }
+@@ -98,30 +113,68 @@ public:
+   {
+     std::unique_lock<std::mutex> lock(mutex);
+     if (state == states::WAIT_END_OF_BURST) {
+-      state = states::START_BURST;
++      // TODO: Handle FDD
++      state = states::IDLE;
+     }
+   }
+ 
+   /// \brief Notifies a new block transmission.
+   /// \param[out] metadata Provides the destination of the required metadata.
+   /// \param[in] time_spec Indicates the transmission time.
++  /// \param[inout] num_samples In - number of samples available to transmit.
++  ///           Out - number of samples to deal with (transmit or discard).
+   /// \return True if the block shall be transmitted. False if the block shall be ignored.
+-  bool transmit_block(uhd::tx_metadata_t& metadata, uhd::time_spec_t& time_spec)
++  bool transmit_block(
++      uhd::tx_metadata_t& metadata,
++      uhd::time_spec_t& time_spec,
++      unsigned& num_samples)
+   {
++    bool result;
+     std::unique_lock<std::mutex> lock(mutex);
++    // Determine how many samples are going to get pulled out
++    // Also determine the metadata characteristics
+     switch (state) {
++      case states::UNINITIALIZED:
++        num_samples = 0;
++        result = false;
++        break;
+       case states::START_BURST:
+         // Set start of burst flag and time spec.
+         metadata.has_time_spec  = true;
+         metadata.start_of_burst = true;
+         metadata.time_spec      = time_spec;
++
+         // Transition to in-burst.
+         state = states::IN_BURST;
++
++        if(end_of_burst) {
++          if(num_samples > *end_of_burst) {
++            // Only transmit up to the end of the burst
++            num_samples = *end_of_burst;
++            metadata.end_of_burst = true;
++            state                 = states::IDLE;
++            end_of_burst.reset();
++          }
++        }
++
++        result = true;
++
+         break;
+       case states::IN_BURST:
+-        // All good.
++        if(end_of_burst) {
++          if(num_samples > *end_of_burst) {
++            // Only transmit up to the end of the burst
++            num_samples = *end_of_burst;
++            metadata.end_of_burst = true;
++            state                 = states::IDLE;
++            end_of_burst.reset();
++          }
++        }
++
++        result = true;
++
+         break;
+-      case states::END_OF_BURST:
++      case states::UNDERFLOW_RECOVERY:
+         // Flag end-of-burst.
+         metadata.end_of_burst = true;
+         state                 = states::WAIT_END_OF_BURST;
+@@ -129,29 +182,71 @@ public:
+           wait_eob_timeout = metadata.time_spec;
+           wait_eob_timeout += WAIT_EOB_ACK_TIMEOUT_S;
+         }
+-        break;
++        result = true;
+       case states::WAIT_END_OF_BURST:
++        num_samples = 0;
+         // Consider starting the burst if the wait for end-of-burst expired.
+         if (wait_eob_timeout.get_real_secs() < time_spec.get_real_secs()) {
+-          // Set start of burst flag and time spec.
+-          metadata.has_time_spec  = true;
+-          metadata.start_of_burst = true;
+-          metadata.time_spec      = time_spec;
+-          // Transition to in-burst.
+-          state = states::IN_BURST;
+-          break;
++          // Transition to idle.
++          state = states::IDLE;
+         }
+-      case states::UNINITIALIZED:
++
++        result = false;
++
++        break;
++      case states::IDLE:
++        if(start_of_burst) {
++          if(num_samples >= *start_of_burst) {
++            // Consume the remaining samples before sending a start of burst
++            num_samples = *start_of_burst;
++            state = states::START_BURST;
++            start_of_burst.reset();
++          }
++        }
++
++        result = false;
++
++        break;
+       case states::WAIT_STOP:
++        num_samples = 0;
++        result = false;
++        break;
+       case states::STOPPED:
+-        // Ignore transmission.
+-        return false;
++        num_samples = 0;
++        result = false;
++        break;
++    }
++
++    if(start_of_burst) {
++      *start_of_burst -= num_samples;
++    }
++    if(end_of_burst) {
++      *end_of_burst -= num_samples;
+     }
+ 
+     // Transmission shall not be ignored.
+-    return true;
++    return result;
++  }
++
++  // Name chosen for a future fix where sob/eob are vectors
++  void queue_start_of_burst(unsigned start_of_burst_)
++  {
++    if(start_of_burst_ > 700) {
++      start_of_burst_ -= 700;
++    } else {
++      start_of_burst_ = 0;
++    }
++    srsran_assert(!start_of_burst, "SoB vector not yet implemented");
++    start_of_burst = start_of_burst_;
++  }
++
++  void queue_end_of_burst(unsigned end_of_burst_)
++  {
++    srsran_assert(!end_of_burst, "EoB vector not yet implemented");
++    end_of_burst = end_of_burst_;
+   }
+ 
++  // TODO: I seem to have killed stop
+   void stop(uhd::tx_metadata_t& metadata)
+   {
+     std::unique_lock<std::mutex> lock(mutex);
+diff --git a/lib/ran/tdd_ul_dl_config.cpp b/lib/ran/tdd_ul_dl_config.cpp
+index bcaad0482..7f3fac5e8 100644
+--- a/lib/ran/tdd_ul_dl_config.cpp
++++ b/lib/ran/tdd_ul_dl_config.cpp
+@@ -122,3 +122,22 @@ optional<unsigned> srsran::find_next_tdd_full_ul_slot(const tdd_ul_dl_config_com
+   }
+   return ret;
+ }
++
++bool srsran::is_last_tdd_dl_symbol(const tdd_ul_dl_config_common& cfg,
++                                   unsigned slot_index,
++                                   unsigned symbol_index,
++                                   cyclic_prefix cp)
++{
++  if(is_tdd_full_dl_slot(cfg, slot_index)) {
++    if(symbol_index == get_nsymb_per_slot(cp) - 1) {
++      return !has_active_tdd_dl_symbols(cfg, slot_index+1);
++    } else {
++      return false;
++    }
++  } else {
++    return symbol_index+1 ==
++        get_active_tdd_dl_symbols(cfg, slot_index, cp).stop();
++  }
++
++  // Impossible
++}
+diff --git a/tests/unittests/phy/lower/processors/downlink/downlink_processor_test_doubles.h b/tests/unittests/phy/lower/processors/downlink/downlink_processor_test_doubles.h
+index 046e4ab06..fdf7f73b6 100644
+--- a/tests/unittests/phy/lower/processors/downlink/downlink_processor_test_doubles.h
++++ b/tests/unittests/phy/lower/processors/downlink/downlink_processor_test_doubles.h
+@@ -66,7 +66,11 @@ public:
+     baseband_gateway_timestamp        timestamp;
+   };
+ 
+-  void process(baseband_gateway_buffer_writer& buffer, baseband_gateway_timestamp timestamp) override
++  void process(
++    baseband_gateway_buffer_writer& buffer,
++    baseband_gateway_timestamp timestamp,
++    optional<baseband_gateway_timestamp>& start,
++    optional<baseband_gateway_timestamp>& stop) override
+   {
+     for (unsigned i_channel = 0, i_channel_end = buffer.get_nof_channels(); i_channel != i_channel_end; ++i_channel) {
+       span<cf_t> samples = buffer.get_channel_buffer(i_channel);
+@@ -151,4 +155,4 @@ private:
+   std::vector<lower_phy_downlink_processor_spy*> entries;
+ };
+ 
+-} // namespace srsran
+\ No newline at end of file
++} // namespace srsran
+diff --git a/tests/unittests/phy/lower/processors/downlink/lower_phy_downlink_processor_test.cpp b/tests/unittests/phy/lower/processors/downlink/lower_phy_downlink_processor_test.cpp
+index f3a22acdf..79fd43059 100644
+--- a/tests/unittests/phy/lower/processors/downlink/lower_phy_downlink_processor_test.cpp
++++ b/tests/unittests/phy/lower/processors/downlink/lower_phy_downlink_processor_test.cpp
+@@ -241,6 +241,8 @@ TEST_P(LowerPhyDownlinkProcessorFixture, Flow)
+   subcarrier_spacing scs          = std::get<2>(GetParam());
+   cyclic_prefix      cp           = std::get<3>(GetParam());
+ 
++  optional<baseband_gateway_timestamp> start, stop;
++
+   unsigned base_symbol_size = srate.get_dft_size(scs);
+ 
+   baseband_gateway_buffer_dynamic buffer(nof_rx_ports, 2 * base_symbol_size);
+@@ -273,7 +275,8 @@ TEST_P(LowerPhyDownlinkProcessorFixture, Flow)
+           amplitude_control_spy->clear();
+ 
+           // Process baseband.
+-          dl_proc_baseband.process(buffer.get_writer(), timestamp);
++          dl_proc_baseband.process(buffer.get_writer(), timestamp,
++                                   start, stop);
+ 
+           // Prepare expected PDxCH baseband entry context.
+           pdxch_processor_baseband::symbol_context pdxch_context;

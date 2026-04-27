@@ -1,0 +1,16 @@
+[Unit]
+Description=OAI gNB
+After=network.target
+
+[Service]
+Type=simple
+# hmm, need a user to supply $HOME or $XDG_CONFIG_HOME for UHD
+Environment=HOME=/root
+Restart=always
+RestartSec=1
+ExecStart=/var/tmp/srsRAN_Project/build/apps/gnb/gnb -c /var/tmp/etc/srsran/gnb_rf_b200_tdd_n78_20mhz.yml -c /var/tmp/etc/srsran/slicing.yml
+StandardOutput=append:/var/log/srs-gnb.log
+StandardError=append:/var/log/srs-gnb.log
+
+[Install]
+WantedBy=multi-user.target
