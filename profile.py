@@ -109,8 +109,9 @@ UBUNTU_IMG = "urn:publicid:IDN+emulab.net+image+emulab-ops//UBUNTU22-64-STD"
 COTS_UE_IMG = "urn:publicid:IDN+emulab.net+image+PowderTeam:cots-jammy-image"
 COMP_MANAGER_ID = "urn:publicid:IDN+emulab.net+authority+cm"
 DEFAULT_SRSRAN_HASH = "5e6f50a202c6efa671d5b231d7c911dc6c3d86ed"
+DEFAULT_OPEN5GS_TAG = "v2.7.6"
 SRSRAN_DEPLOY_SCRIPT = os.path.join(BIN_PATH, "deploy-srsran.sh")
-OPEN5GS_DEPLOY_SCRIPT = os.path.join(BIN_PATH, "deploy-open5gs.sh")
+OPEN5GS_DEPLOY_SCRIPT = os.path.join(BIN_PATH, "deploy-open5gs-source.sh")
 TEST_TOOLS_DEPLOY_SCRIPT = os.path.join(BIN_PATH, "deploy-test-tools.sh")
 
 def gnb_cn_pair(idx, dense_radio):
@@ -341,7 +342,8 @@ if params.include_orch:
     cmd = "{} {}".format(TEST_TOOLS_DEPLOY_SCRIPT, "core")
     cn_node.addService(pg.Execute(shell="bash", command=cmd))
 
-cn_node.addService(pg.Execute(shell="bash", command=OPEN5GS_DEPLOY_SCRIPT))
+cmd = "{} '{}'".format(OPEN5GS_DEPLOY_SCRIPT, DEFAULT_OPEN5GS_TAG)
+cn_node.addService(pg.Execute(shell="bash", command=cmd))
 
 for idx, dense_radio in enumerate(params.dense_radios):
     gnb_cn_pair(idx, dense_radio)

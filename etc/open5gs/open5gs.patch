@@ -1,0 +1,10 @@
+# Placeholder for Open5GS source patch.
+#
+# When you have changes to apply on top of the pinned Open5GS source tree,
+# replace the contents of this file with the output of `git diff` (or an
+# equivalent unified diff) generated against the version specified by
+# DEFAULT_OPEN5GS_TAG in profile.py.
+#
+# The deploy script (bin/deploy-open5gs-source.sh) detects a real patch by
+# the presence of a unified-diff `---` line and skips this file otherwise,
+# so an unedited placeholder is a safe no-op.
