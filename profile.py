@@ -110,7 +110,7 @@ The `uemncmp` node and acompanying SDR is included to allow for, e.g.:
 - injecting interference in the DL path
 - recording samples of UL transmissions for data gathering purposes
 
-GnuRadio and UHD tools are installed on this nodes. Debug.
+GnuRadio and UHD tools are installed on this nodes. Debug. Debug (pushed to run source).
 
 
 """
