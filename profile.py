@@ -99,7 +99,7 @@ ping <IP address of UE>  # you can find the IP address of the UE in the connecti
 
 Known Issues:
 
-- Until handover is implemented, the UE will not roam between gNodeBs. This means that if the shuttle moves from one dense deployment site to another, the UE will lose its connection to the network. The UE will re-attach to the network when it comes back into range of a gNodeB. This can lead to issues with the core network in some cases, e.g., when the UE is moving between two gNodeBs with overlapping coverage.
+- Until handover is implemented, the UE will not roam between gNodeBs. This means that if the shuttle moves from one dense deployment site to another, the UE will lose its connection to the network. The UE will re-attach to the network when it comes back into range of a gNodeB. This can lead to issues with the core network in some cases, e.g., when the UE is moving between two gNodeBs with overlapping coverage. Debug.
 
 """
 
