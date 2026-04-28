@@ -121,7 +121,9 @@ UBUNTU_IMG = "urn:publicid:IDN+emulab.net+image+emulab-ops//UBUNTU22-64-STD"
 COTS_UE_IMG = "urn:publicid:IDN+emulab.net+image+PowderTeam:cots-jammy-image"
 COMP_MANAGER_ID = "urn:publicid:IDN+emulab.net+authority+cm"
 DEFAULT_SRSRAN_HASH = "release_25_10"
-OPEN5GS_DEPLOY_SCRIPT = os.path.join(BIN_PATH, "deploy-open5gs.sh")
+DEFAULT_OPEN5GS_TAG = "v2.7.6"
+# OPEN5GS_DEPLOY_SCRIPT = os.path.join(BIN_PATH, "deploy-open5gs.sh")
+OPEN5GS_DEPLOY_SCRIPT = os.path.join(BIN_PATH, "deploy-open5gs-source.sh")
 SRSRAN_DEPLOY_SCRIPT = os.path.join(BIN_PATH, "deploy-srsran.sh")
 NODE_IDS = {
     "sdru": "x310-1",
@@ -211,7 +213,9 @@ cn_if.addAddress(pg.IPv4Address("192.168.1.1", "255.255.255.0"))
 cn_link = request.Link("{}-link".format(role))
 cn_link.setNoBandwidthShaping()
 cn_link.addInterface(cn_if)
-cn_node.addService(pg.Execute(shell="bash", command=OPEN5GS_DEPLOY_SCRIPT))
+# cn_node.addService(pg.Execute(shell="bash", command=OPEN5GS_DEPLOY_SCRIPT))
+cmd = "{} '{}'".format(OPEN5GS_DEPLOY_SCRIPT, DEFAULT_OPEN5GS_TAG)
+cn_node.addService(pg.Execute(shell="bash", command=cmd))
 
 # collect node objects for RF matrix
 matrix_nodes = {}
