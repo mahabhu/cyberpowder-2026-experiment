@@ -1,8 +1,7 @@
 diff --git a/lib/radio/uhd/radio_uhd_device.h b/lib/radio/uhd/radio_uhd_device.h
-index df77ab7be..656acfbeb 100644
 --- a/lib/radio/uhd/radio_uhd_device.h
 +++ b/lib/radio/uhd/radio_uhd_device.h
-@@ -153,7 +153,23 @@ public:
+@@ -158,7 +158,23 @@
  
      fmt::print("Making USRP object with args '{}'\n", device_addr.to_string());
  
@@ -25,5 +24,584 @@ index df77ab7be..656acfbeb 100644
 +		    usrp->set_gpio_attr("FP0", "OUT", 7<<7, 0xf80);
 +		    });
    }
+ 
    bool is_connection_valid()
-   {
+diff --git a/lib/cu_cp/CMakeLists.txt b/lib/cu_cp/CMakeLists.txt
+--- a/lib/cu_cp/CMakeLists.txt
++++ b/lib/cu_cp/CMakeLists.txt
+@@ -24,6 +24,7 @@
+ add_subdirectory(ue_security_manager)
+ 
+ set(SOURCES
++        rrc_socket.cpp
+         cu_cp_factory.cpp
+         cu_cp_impl.cpp
+         cu_configurator_impl.cpp
+diff --git a/lib/cu_cp/cu_cp_impl.cpp b/lib/cu_cp/cu_cp_impl.cpp
+--- a/lib/cu_cp/cu_cp_impl.cpp
++++ b/lib/cu_cp/cu_cp_impl.cpp
+@@ -101,6 +101,93 @@
+ {
+   assert_cu_cp_configuration_valid(cfg);
+ 
++  test_server = std::make_unique<rrc_server>(60001, [this](test_command cmd) -> bool {
++    logger.info("test_server: dispatching command {}", static_cast<int>(cmd));
++
++    /* All non-echo gNB symbols are routed to the same passive-sync /
++     * synthetic-ack handler per family, mirroring the AMF semi-passive
++     * model. Modern srsRAN CU-CP doesn't expose a separate active
++     * trigger for each "_replay / _plain_text / _ns / _null_security"
++     * variant — the underlying RRC procedure is the same one driven by
++     * the auto-flow's NGAP InitialContextSetupRequest. So per the user
++     * spec ("if only one function exists, route variants to it"), all
++     * variants of a family return the same behaviour:
++     *
++     *   SMC family (7 variants)        -> passive sync, "rrc_sm_cmd_complete"
++     *   UE Cap family (2 variants)     -> passive sync, "rrc_ue_cap_info"
++     *   Reconf family (3 variants)     -> passive sync, "rrc_reconf_complete"
++     *   Counter Check (2 variants)     -> immediate "null_action" (no proc in srsRAN)
++     *   UE Info Request (2 variants)   -> immediate "null_action" (no proc in srsRAN)
++     *   Release / Reestablishment      -> immediate "null_action" (not yet wired)
++     *
++     * The async response symbols for the first three families are pushed
++     * from rrc_ue_message_handlers.cpp when the UE replies to the
++     * auto-flow's procedures. */
++    switch (cmd) {
++      // ===== SMC family — passive sync =====
++      case test_command::rrc_sm_cmd:
++      case test_command::rrc_sm_cmd_replay:
++      case test_command::rrc_sm_cmd_protected:
++      case test_command::rrc_sm_cmd_plain_text:
++      case test_command::rrc_sm_cmd_null_security:
++      case test_command::rrc_sm_cmd_ns:
++      case test_command::rrc_sm_cmd_ns_plain_text:
++        logger.info("test_server: SMC variant -> passive sync");
++        return true;
++
++      // ===== UE Capability Enquiry family — passive sync =====
++      case test_command::ue_cap_enquiry_protected:
++      case test_command::ue_cap_enquiry_plaintext:
++        logger.info("test_server: UE Cap variant -> passive sync");
++        return true;
++
++      // ===== RRC Reconfiguration family — passive sync =====
++      case test_command::rrc_reconf_protected:
++      case test_command::rrc_reconf_replay:
++      case test_command::rrc_reconf_plain_text:
++        logger.info("test_server: Reconf variant -> passive sync");
++        return true;
++
++      // ===== Counter Check family — synthetic null_action =====
++      // Counter Check (TS 38.331 §5.3.6) is an optional procedure not
++      // wired up in srsRAN_Project's CU-CP. Emit immediately so the
++      // testing client doesn't block.
++      case test_command::rrc_countercheck_protected:
++      case test_command::rrc_countercheck_plain_text:
++        logger.warning("test_server: Counter Check not implemented in srsRAN; "
++                       "synthesising null_action");
++        if (test_server) {
++          test_server->notify_response("null_action\n");
++        }
++        return true;
++
++      // ===== UE Information Request family — synthetic null_action =====
++      // UE Information Request (TS 38.331 §5.7.10) likewise not exposed
++      // by srsRAN_Project as a standalone trigger.
++      case test_command::rrc_ueinfo_req_protected:
++      case test_command::rrc_ueinfo_req_plain_text:
++        logger.warning("test_server: UE Info Request not implemented in srsRAN; "
++                       "synthesising null_action");
++        if (test_server) {
++          test_server->notify_response("null_action\n");
++        }
++        return true;
++
++      // ===== Release / Reestablishment — not yet wired =====
++      case test_command::rrc_release:
++      case test_command::rrc_reest_protected:
++      case test_command::rrc_reest_plain_text:
++        logger.warning("test_server: cmd {} not yet wired", static_cast<int>(cmd));
++        return false;
++
++      case test_command::unknown:
++      default:
++        return false;
++    }
++  });
++
++  rrc_server::set_instance(test_server.get());
++
+   nrppa_entity = create_nrppa_entity(cfg, nrppa_cu_cp_ev_notifier, common_task_sched);
+ 
+   // Connect event notifiers to layers.
+@@ -140,7 +227,11 @@
+     report_fatal_error("Failed to initiate CU-CP setup");
+   }
+   // Block waiting for CU-CP setup to complete.
+-  return fut.get();
++  bool ok = fut.get();
++  if (ok) {
++    test_server->start();
++  }
++  return ok;
+ }
+ 
+ void cu_cp_impl::stop()
+@@ -165,6 +256,7 @@
+   }
+   ev.wait();
+ 
++  test_server->stop();
+   controller.stop();
+   logger.info("CU-CP stopped successfully.");
+ }
+@@ -1004,6 +1096,9 @@
+ 
+ void cu_cp_impl::handle_rrc_ue_creation(ue_index_t ue_index, rrc_ue_interface& rrc_ue)
+ {
++  current_ue_index = ue_index;
++  test_server->notify_rrc_connection();
++
+   // Store the RRC UE in the UE manager.
+   auto* ue = ue_mng.find_ue(ue_index);
+   ue->set_rrc_ue(rrc_ue);
+diff --git a/lib/cu_cp/cu_cp_impl.h b/lib/cu_cp/cu_cp_impl.h
+--- a/lib/cu_cp/cu_cp_impl.h
++++ b/lib/cu_cp/cu_cp_impl.h
+@@ -34,6 +34,7 @@
+ #include "cu_up_processor/cu_up_processor_repository.h"
+ #include "du_processor/du_processor_repository.h"
+ #include "ngap_repository.h"
++#include "rrc_socket.h"
+ #include "ue_manager/ue_manager_impl.h"
+ #include "srsran/cu_cp/cu_configurator.h"
+ #include "srsran/cu_cp/cu_cp_configuration.h"
+@@ -262,6 +263,9 @@
+ 
+   cu_configurator_impl cu_cp_cfgtr;
+ 
++  std::unique_ptr<rrc_server> test_server;
++  ue_index_t                  current_ue_index = ue_index_t::invalid;
++
+   // Metrics report session for the lifetime of the CU-CP.
+   // Used, e.g., for logging metrics and JSON metrics.
+   std::unique_ptr<metrics_report_session> metrics_session;
+diff --git a/lib/rrc/ue/rrc_ue_message_handlers.cpp b/lib/rrc/ue/rrc_ue_message_handlers.cpp
+--- a/lib/rrc/ue/rrc_ue_message_handlers.cpp
++++ b/lib/rrc/ue/rrc_ue_message_handlers.cpp
+@@ -33,6 +33,7 @@
+ #include "srsran/asn1/rrc_nr/dl_ccch_msg.h"
+ #include "srsran/asn1/rrc_nr/dl_dcch_msg_ies.h"
+ #include "srsran/asn1/rrc_nr/ul_ccch_msg.h"
++#include "srsran/cu_cp/test_client_notify.h"
+ #include "srsran/ran/rb_id.h"
+ #include <chrono>
+ 
+@@ -192,12 +193,15 @@
+       break;
+     case ul_dcch_msg_type_c::c1_c_::types_opts::security_mode_complete:
+       handle_rrc_transaction_complete(ul_dcch_msg, ul_dcch_msg.msg.c1().security_mode_complete().rrc_transaction_id);
++      notify_test_client("rrc_sm_cmd_complete\n");
+       break;
+     case ul_dcch_msg_type_c::c1_c_::types_opts::security_mode_fail:
+       handle_rrc_transaction_complete(ul_dcch_msg, ul_dcch_msg.msg.c1().security_mode_fail().rrc_transaction_id);
++      notify_test_client("rrc_sm_cmd_fail\n");
+       break;
+     case ul_dcch_msg_type_c::c1_c_::types_opts::ue_cap_info:
+       handle_rrc_transaction_complete(ul_dcch_msg, ul_dcch_msg.msg.c1().ue_cap_info().rrc_transaction_id);
++      notify_test_client("rrc_ue_cap_info\n");
+       break;
+     case ul_dcch_msg_type_c::c1_c_::types_opts::rrc_recfg_complete:
+       handle_rrc_transaction_complete(ul_dcch_msg, ul_dcch_msg.msg.c1().rrc_recfg_complete().rrc_transaction_id);
+@@ -205,6 +209,7 @@
+         context.transfer_context.value().is_inter_cu_handover = false;
+         cu_cp_notifier.on_rrc_reconfiguration_complete_indicator();
+       }
++      notify_test_client("rrc_reconf_complete\n");
+       break;
+     case ul_dcch_msg_type_c::c1_c_::types_opts::rrc_reest_complete:
+       handle_rrc_transaction_complete(ul_dcch_msg, ul_dcch_msg.msg.c1().rrc_reest_complete().rrc_transaction_id);
+diff --git a/include/srsran/cu_cp/test_client_notify.h b/include/srsran/cu_cp/test_client_notify.h
+new file mode 100644
+--- /dev/null
++++ b/include/srsran/cu_cp/test_client_notify.h
+@@ -0,0 +1,15 @@
++#pragma once
++
++#include <string>
++
++namespace srsran {
++namespace srs_cu_cp {
++
++/// Push an event symbol to the LogExecutor testing client over the
++/// gNB test socket (no-op if no client is connected). Called by the
++/// RRC layer when significant UE messages are received, so passive
++/// dispatcher commands (e.g. rrc_sm_cmd) get a meaningful response.
++void notify_test_client(const std::string& msg);
++
++} // namespace srs_cu_cp
++} // namespace srsran
+diff --git a/lib/cu_cp/rrc_socket.cpp b/lib/cu_cp/rrc_socket.cpp
+new file mode 100644
+--- /dev/null
++++ b/lib/cu_cp/rrc_socket.cpp
+@@ -0,0 +1,254 @@
++#include "rrc_socket.h"
++
++#include "srsran/cu_cp/test_client_notify.h"
++#include <arpa/inet.h>
++#include <cstring>
++#include <netinet/in.h>
++#include <sys/socket.h>
++#include <thread>
++#include <unistd.h>
++
++namespace srsran {
++namespace srs_cu_cp {
++
++std::atomic<rrc_server*> rrc_server::g_instance{nullptr};
++
++void rrc_server::set_instance(rrc_server* inst)
++{
++  g_instance.store(inst);
++}
++
++void rrc_server::notify(const std::string& msg)
++{
++  rrc_server* inst = g_instance.load();
++  if (inst != nullptr) {
++    inst->notify_response(msg);
++  }
++}
++
++/* Free function defined in test_client_notify.h. Allows non-cu_cp modules
++ * (e.g. lib/rrc/ue) to push event notifications without depending on the
++ * full rrc_server type. */
++void notify_test_client(const std::string& msg)
++{
++  rrc_server::notify(msg);
++}
++
++rrc_server::rrc_server(uint16_t port_, test_command_dispatcher dispatcher_) :
++  port(port_), dispatcher(std::move(dispatcher_)), logger(srslog::fetch_basic_logger("TESTSRV"))
++{
++}
++
++rrc_server::~rrc_server()
++{
++  if (g_instance.load() == this) {
++    g_instance.store(nullptr);
++  }
++  stop();
++}
++
++void rrc_server::start()
++{
++  if (running.exchange(true)) {
++    return;
++  }
++  worker = std::thread([this]() { run(); });
++}
++
++void rrc_server::stop()
++{
++  if (!running.exchange(false)) {
++    return;
++  }
++  if (listen_fd >= 0) {
++    ::shutdown(listen_fd, SHUT_RDWR);
++    ::close(listen_fd);
++    listen_fd = -1;
++  }
++  {
++    std::lock_guard<std::mutex> lk(conn_mutex);
++    if (conn_fd >= 0) {
++      ::close(conn_fd);
++      conn_fd = -1;
++    }
++  }
++  if (worker.joinable()) {
++    worker.join();
++  }
++}
++
++void rrc_server::run()
++{
++  logger.info("testing client server thread started");
++
++  listen_fd = ::socket(AF_INET, SOCK_STREAM, 0);
++  if (listen_fd < 0) {
++    logger.error("socket() failed: {}", strerror(errno));
++    return;
++  }
++
++  int opt = 1;
++  ::setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt));
++
++  sockaddr_in addr{};
++  addr.sin_family      = AF_INET;
++  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
++  addr.sin_port        = htons(port);
++
++  if (::bind(listen_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
++    logger.error("bind({}) failed: {}", port, strerror(errno));
++    ::close(listen_fd);
++    listen_fd = -1;
++    return;
++  }
++  if (::listen(listen_fd, 1) < 0) {
++    logger.error("listen() failed: {}", strerror(errno));
++    ::close(listen_fd);
++    listen_fd = -1;
++    return;
++  }
++  printf("[rrc_socket] listening on 127.0.0.1:%u — waiting for testing client...\n", port);
++  fflush(stdout);
++  logger.info("listening on 127.0.0.1:{}", port);
++
++  while (running.load()) {
++    sockaddr_in peer{};
++    socklen_t   peer_len = sizeof(peer);
++    int         fd       = ::accept(listen_fd, reinterpret_cast<sockaddr*>(&peer), &peer_len);
++    if (fd < 0) {
++      if (running.load()) {
++        logger.warning("accept() failed: {}", strerror(errno));
++      }
++      continue;
++    }
++
++    {
++      std::lock_guard<std::mutex> lk(conn_mutex);
++      conn_fd = fd;
++    }
++    printf("[rrc_socket] testing client connected to gNB (fd=%d)\n", conn_fd);
++    fflush(stdout);
++    logger.info("testing client connected");
++
++    char buf[512];
++    while (running.load()) {
++      ssize_t n = ::read(conn_fd, buf, sizeof(buf) - 1);
++      if (n <= 0) {
++        printf("[rrc_socket] testing client disconnected\n");
++        fflush(stdout);
++        logger.info("testing client disconnected");
++        break;
++      }
++      buf[n] = '\0';
++
++      std::string token(buf);
++      while (!token.empty() &&
++             (token.back() == '\n' || token.back() == '\r' || token.back() == ' ')) {
++        token.pop_back();
++      }
++
++      logger.info("received query: '{}'", token);
++
++      if (token == "Hello") {
++        notify_response("ACK from gnb\n");
++        continue;
++      }
++
++      if (token == "RACH_Reset") {
++        rach_counter_reset();
++        notify_response("DONE\n");
++        continue;
++      }
++
++      // Wait for UE RRC connection before executing any protocol command.
++      while (!rrc_connected.load()) {
++        std::this_thread::yield();
++      }
++
++      if (rach_count.load() > 1) {
++        logger.warning("RACH count > 1, rejecting command '{}'", token);
++        notify_response("null_action\n");
++        continue;
++      }
++
++      test_command cmd = parse(token);
++      if (cmd == test_command::unknown) {
++        logger.warning("unknown command '{}'", token);
++        notify_response("null_action\n");
++        continue;
++      }
++
++      logger.info("dispatching '{}'", token);
++      bool handled = dispatcher && dispatcher(cmd);
++      if (!handled) {
++        notify_response("null_action\n");
++      }
++    }
++
++    {
++      std::lock_guard<std::mutex> lk(conn_mutex);
++      ::close(conn_fd);
++      conn_fd = -1;
++    }
++    rrc_connected.store(false);
++    rach_count.store(0);
++  }
++}
++
++bool rrc_server::notify_response(const std::string& msg)
++{
++  std::lock_guard<std::mutex> lk(conn_mutex);
++  if (conn_fd < 0) {
++    logger.warning("notify_response: no client connected");
++    return false;
++  }
++  ssize_t sent = ::send(conn_fd, msg.data(), msg.size(), 0);
++  if (sent < 0) {
++    logger.error("send() failed: {}", strerror(errno));
++    return false;
++  }
++  return true;
++}
++
++void rrc_server::notify_rrc_connection()
++{
++  rrc_connected.store(true);
++}
++
++void rrc_server::rach_counter_increment()
++{
++  rach_count.fetch_add(1);
++}
++
++void rrc_server::rach_counter_reset()
++{
++  rach_count.store(0);
++}
++
++test_command rrc_server::parse(const std::string& t)
++{
++  if (t == "rrc_sm_cmd")               return test_command::rrc_sm_cmd;
++  if (t == "rrc_sm_cmd_replay")        return test_command::rrc_sm_cmd_replay;
++  if (t == "rrc_sm_cmd_protected")     return test_command::rrc_sm_cmd_protected;
++  if (t == "rrc_sm_cmd_plain_text")    return test_command::rrc_sm_cmd_plain_text;
++  if (t == "rrc_sm_cmd_null_security") return test_command::rrc_sm_cmd_null_security;
++  if (t == "rrc_sm_cmd_ns")            return test_command::rrc_sm_cmd_ns;
++  if (t == "rrc_sm_cmd_ns_plain_text") return test_command::rrc_sm_cmd_ns_plain_text;
++  if (t == "ue_cap_enquiry_protected") return test_command::ue_cap_enquiry_protected;
++  if (t == "ue_cap_enquiry_plaintext") return test_command::ue_cap_enquiry_plaintext;
++  if (t == "ue_cap_enquiry_plain_text") return test_command::ue_cap_enquiry_plaintext; // alias used in symbols.gnb.conf
++  if (t == "rrc_reconf_protected")     return test_command::rrc_reconf_protected;
++  if (t == "rrc_reconf_replay")        return test_command::rrc_reconf_replay;
++  if (t == "rrc_reconf_plain_text")    return test_command::rrc_reconf_plain_text;
++  if (t == "rrc_countercheck_protected")  return test_command::rrc_countercheck_protected;
++  if (t == "rrc_countercheck_plain_text") return test_command::rrc_countercheck_plain_text;
++  if (t == "rrc_ueinfo_req_protected")    return test_command::rrc_ueinfo_req_protected;
++  if (t == "rrc_ueinfo_req_plain_text")   return test_command::rrc_ueinfo_req_plain_text;
++  if (t == "rrc_release")              return test_command::rrc_release;
++  if (t == "rrc_reest_protected")      return test_command::rrc_reest_protected;
++  if (t == "rrc_reest_plain_text")     return test_command::rrc_reest_plain_text;
++  return test_command::unknown;
++}
++
++} // namespace srs_cu_cp
++} // namespace srsran
+diff --git a/lib/cu_cp/rrc_socket.h b/lib/cu_cp/rrc_socket.h
+new file mode 100644
+--- /dev/null
++++ b/lib/cu_cp/rrc_socket.h
+@@ -0,0 +1,100 @@
++#pragma once
++
++#include "srsran/srslog/srslog.h"
++#include <atomic>
++#include <functional>
++#include <mutex>
++#include <string>
++#include <thread>
++
++namespace srsran {
++namespace srs_cu_cp {
++
++/// Commands the test server can dispatch to the RRC/CU-CP layer.
++enum class test_command {
++  // Security Mode Command family — all variants resolve to the same
++  // passive-sync handler in cu_cp_impl (the auto-flow's NGAP
++  // InitialContextSetupRequest drives the actual RRC SMC; the response
++  // symbol "rrc_sm_cmd_complete" is pushed by the rrc_ue hook).
++  rrc_sm_cmd,
++  rrc_sm_cmd_replay,
++  rrc_sm_cmd_protected,
++  rrc_sm_cmd_plain_text,
++  rrc_sm_cmd_null_security,
++  rrc_sm_cmd_ns,                  // alias used by symbols.gnb.conf
++  rrc_sm_cmd_ns_plain_text,       // alias used by symbols.gnb.conf
++  // UE Capability Enquiry family
++  ue_cap_enquiry_protected,
++  ue_cap_enquiry_plaintext,
++  // RRC Reconfiguration family
++  rrc_reconf_protected,
++  rrc_reconf_replay,
++  rrc_reconf_plain_text,
++  // Counter Check / UE Information Request — modern srsRAN doesn't
++  // expose an active trigger nor a UE response handler for these in
++  // the CU-CP. Treated as immediate null_action so LogExecutor doesn't
++  // block waiting forever.
++  rrc_countercheck_protected,
++  rrc_countercheck_plain_text,
++  rrc_ueinfo_req_protected,
++  rrc_ueinfo_req_plain_text,
++  // Other (currently stubs)
++  rrc_release,
++  rrc_reest_protected,
++  rrc_reest_plain_text,
++  unknown
++};
++
++/// Returns true if the dispatcher took ownership of the response
++/// (will call notify_response asynchronously). Returns false to
++/// let rrc_server send a default "null_action" response.
++using test_command_dispatcher = std::function<bool(test_command)>;
++
++/// TCP server that accepts a single testing-client connection and
++/// dispatches commands to the CU-CP layer.
++class rrc_server
++{
++public:
++  rrc_server(uint16_t port, test_command_dispatcher dispatcher_);
++  ~rrc_server();
++
++  void start();
++  void stop();
++
++  /// Send a response string back to the connected testing client.
++  bool notify_response(const std::string& msg);
++
++  /// Called by the RRC layer once a UE RRC connection is established.
++  void notify_rrc_connection();
++
++  void rach_counter_increment();
++  void rach_counter_reset();
++
++  /// Register this server as the global instance so RRC layer code can
++  /// asynchronously push event notifications (e.g. SMC complete) without
++  /// holding a direct reference. Pass nullptr to clear.
++  static void set_instance(rrc_server* inst);
++
++  /// Send a message to the registered global instance (no-op if unset).
++  static void notify(const std::string& msg);
++
++private:
++  void run();
++  static test_command parse(const std::string& token);
++
++  uint16_t                port;
++  test_command_dispatcher dispatcher;
++  std::atomic<bool>       running{false};
++  std::thread             worker;
++  int                     listen_fd = -1;
++  int                     conn_fd   = -1;
++  std::mutex              conn_mutex;
++  std::atomic<bool>       rrc_connected{false};
++  std::atomic<int>        rach_count{0};
++  srslog::basic_logger&   logger;
++
++  static std::atomic<rrc_server*> g_instance;
++};
++
++} // namespace srs_cu_cp
++} // namespace srsran
