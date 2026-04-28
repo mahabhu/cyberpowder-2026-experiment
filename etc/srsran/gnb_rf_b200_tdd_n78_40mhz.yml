@@ -3,20 +3,18 @@
 # as the RF frontend using split 8. Note in this example an external clock source is not used, so the sync 
 # is not defined and the default is used. 
 
-gnb_id: 10GNBID
-
 amf:
-  addr: 192.168.1.1
-  bind_addr: LANIP                                          # A local IP that the gNB binds to for traffic from the AMF.
+  addr: 155.98.36.114
+  bind_addr: 155.98.36.186
 
 ru_sdr:
   device_driver: uhd                                              # The RF driver name.
   device_args: type=b200,num_recv_frames=64,num_send_frames=64    # Optionally pass arguments to the selected RF driver.
-  srate: 23.04                                                    # RF sample rate might need to be adjusted according to selected bandwidth.
+  srate: 46.08                                                    # RF sample rate might need to be adjusted according to selected bandwidth.
   otw_format: sc12  
   tx_gain: 85                                                     # Transmit gain of the RF might need to adjusted to the given situation.
   rx_gain: 75                                                     # Receive gain of the RF might need to adjusted to the given situation.
-  #lo_offset: 23.04
+    #lo_offset: 23.04
   cells:
     - amplitude_control:
         tx_gain_backoff: 12
@@ -24,11 +22,11 @@ ru_sdr:
 cell_cfg:
   dl_arfcn: 630048                                                # ARFCN of the downlink carrier (center frequency).
   band: 78                                                        # The NR band.
-  channel_bandwidth_MHz: 20                                       # Bandwith in MHz. Number of PRBs will be automatically derived.
+  channel_bandwidth_MHz: 40                                       # Bandwith in MHz. Number of PRBs will be automatically derived.
   common_scs: 30                                                  # Subcarrier spacing in kHz used for data.
   plmn: "99999"                                                   # PLMN broadcasted by the gNB.
   tac: 1                                                          # Tracking area code (needs to match the core configuration).
-  pci: GNBID                                                          # Physical cell ID.
+  pci: 1                                                          # Physical cell ID.
 
 log:
   filename: /tmp/gnb.log                                          # Path of the log file.
