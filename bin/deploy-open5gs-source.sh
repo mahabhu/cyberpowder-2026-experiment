@@ -6,7 +6,7 @@ ETCDIR=/local/repository/etc
 source $BINDIR/common.sh
 
 if [ -z "$TAG" ]; then
-    echo "usage: $0 <open5gs-git-tag>  (e.g. v2.7.6)"
+    echo "usage: $0 <open5gs-git-tag>  (e.g. v2.7.7)"
     exit 1
 fi
 
@@ -80,8 +80,10 @@ sudo useradd -r -g open5gs -s /sbin/nologin -d /var/log/open5gs open5gs 2>/dev/n
 sudo mkdir -p /var/log/open5gs
 sudo chown open5gs:open5gs /var/log/open5gs
 
-# Install systemd unit files (ninja install does NOT do this)
-sudo cp misc/systemd/system/*.service /etc/systemd/system/
+# Install systemd unit files (ninja install does NOT do this).
+# meson generates them under build/configs/systemd with the configured paths
+# substituted in (the configs/systemd/*.in files are templates).
+sudo cp build/configs/systemd/*.service /etc/systemd/system/
 sudo systemctl daemon-reload
 
 # Defensive: make sure /etc/open5gs exists for the config copy below
