@@ -68,8 +68,7 @@ fi
 meson setup build \
     --prefix=/usr \
     --sysconfdir=/etc \
-    --localstatedir=/var \
-    --runstatedir=/run
+    --localstatedir=/var
 ninja -C build
 sudo ninja install -C build
 
