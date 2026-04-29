@@ -62,7 +62,7 @@ On `ue-comp`:
 BIN_PATH = "/local/repository/bin"
 ETC_PATH = "/local/repository/etc"
 IP_NAT_SCRIPT = os.path.join(BIN_PATH, "add-nat-and-ip-forwarding.sh")
-DEFAULT_SRSRAN_HASH = "a15950301c5f3a1a166b79bb6c9ee901a4e8c2dd"
+DEFAULT_SRSRAN_HASH = "4bf1543936d062686d64c10724d2f27a9854f065"
 SRSRAN_DEPLOY_SCRIPT = os.path.join(BIN_PATH, "deploy-srsran.sh")
 OPEN5GS_DEPLOY_SCRIPT = os.path.join(BIN_PATH, "deploy-open5gs.sh")
 COMP_MANAGER_ID = "urn:publicid:IDN+emulab.net+authority+cm"
