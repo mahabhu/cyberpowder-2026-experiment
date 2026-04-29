@@ -41,6 +41,7 @@ cmake ../
 make -j $(nproc)
 
 echo configuring nodeb...
+echo "debug" > $SRCDIR/debug.txt
 mkdir -p $SRCDIR/etc/srsran
 cp -r $ETCDIR/srsran/* $SRCDIR/etc/srsran/
 LANIF=`ip r | awk '/192\.168\.1\.0/{print $3}'`
