@@ -17,4 +17,3 @@ nssf:
         - uri: http://127.0.0.10:7777
           s_nssai:
             sst: 1
-            sd: 0x000001

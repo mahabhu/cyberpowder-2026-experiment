@@ -1,12 +1,8 @@
 
 SRCDIR=/var/tmp
 CFGDIR=/local/repository/etc
-SERVICESDIR=/local/repository/services
-MEREPODIR=$SRCDIR/mobile-enpoints
-MEBINDIR=$MEREPODIR/bin
-MESRVDIR=$MEREPODIR/services
 OAI_RAN_MIRROR="https://gitlab.flux.utah.edu/powder-mirror/openairinterface5g"
-OAI_CN5G_REPO="https://gitlab.eurecom.fr/oai/cn5g/oai-cn5g-fed"
-SRS_PROJECT_REPO="https://github.com/srsran/srsRAN_Project"
+SRS_REPO="https://github.com/srsran/srsRAN"
+SRS_PROJECT_REPO="https://github.com/srsRAN/srsRAN_Project"
+SRSGUI_REPO="https://github.com/srsran/srsGUI"
 OPEN5GS_REPO="https://github.com/open5gs/open5gs"
-UHD_REPO="https://github.com/EttusResearch/uhd"

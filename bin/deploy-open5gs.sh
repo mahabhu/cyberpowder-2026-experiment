@@ -17,7 +17,7 @@ sudo add-apt-repository -y ppa:open5gs/latest
 sudo add-apt-repository -y ppa:wireshark-dev/stable
 echo "wireshark-common wireshark-common/install-setuid boolean false" | sudo debconf-set-selections
 sudo apt update
-sudo apt install -y gnupg
+sudo apt-get install gnupg
 curl -fsSL https://pgp.mongodb.com/server-6.0.asc | \
     sudo gpg -o /usr/share/keyrings/mongodb-server-6.0.gpg --dearmor
 echo "deb [ arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-6.0.gpg ] https://repo.mongodb.org/apt/ubuntu $(lsb_release -cs)/mongodb-org/6.0 multiverse" | \
@@ -26,10 +26,9 @@ sudo apt update
 sudo apt install -y \
     mongodb-org \
     mongodb-mongosh \
-    nginx \
+    iperf3 \
     tshark \
-    wireshark \
-    iperf3
+    wireshark
 
 sudo systemctl start mongod
 sudo systemctl enable mongod
@@ -55,8 +54,6 @@ sudo systemctl restart open5gs-udrd
 cd $SRCDIR
 wget https://raw.githubusercontent.com/open5gs/open5gs/main/misc/db/open5gs-dbctl
 chmod +x open5gs-dbctl
-./open5gs-dbctl add_ue_with_slice 999990000000141 00112233445566778899aabbccddeeff 0ed47545168eafe2c39c075829a7b61f internet 1 000001 # IMSI,K,OPC
-./open5gs-dbctl type 999990000000141 1  # APN type IPV4
-./open5gs-dbctl add_ue_with_slice 999990000000118 00112233445566778899aabbccddeeff 0ed47545168eafe2c39c075829a7b61f internet 1 000001 # IMSI,K,OPC
-./open5gs-dbctl type 999990000000118 1  # APN type IPV4
+./open5gs-dbctl add_ue_with_apn 901700123456789 00112233445566778899aabbccddeeff 63BFA50EE6523365FF14C1F45F88737D srsapn  # IMSI,K,OPC
+./open5gs-dbctl type 901700123456789 1  # APN type IPV4
 touch $SRCDIR/open5gs-setup-complete
