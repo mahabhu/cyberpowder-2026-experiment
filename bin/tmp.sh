@@ -6,7 +6,7 @@ ETCDIR=/local/repository/etc
 source $BINDIR/common.sh
 
 if [ -z "$TAG" ]; then
-    echo "usage: $0 <open5gs-git-tag>  (e.g. v2.7.6)"
+    echo "usage: $0 <open5gs-git-tag>  (e.g. v2.7.7)"
     exit 1
 fi
 
