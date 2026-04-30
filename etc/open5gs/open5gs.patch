@@ -1538,7 +1538,7 @@ diff --git a/src/amf/amf-socket.c b/src/amf/amf-socket.c
 new file mode 100644
 --- /dev/null
 +++ b/src/amf/amf-socket.c
-@@ -0,0 +1,461 @@
+@@ -0,0 +1,477 @@
 +#include <arpa/inet.h>
 +#include <netinet/in.h>
 +#include <stdio.h>
@@ -1779,12 +1779,28 @@ new file mode 100644
 +            /* Process the auth vector and send Auth Request to UE. */
 +            ogs_sbi_message_t *auth_msg =
 +                (ogs_sbi_message_t *)event_auth->h.sbi.message;
-+            amf_nausf_auth_handle_authenticate(amf_ue, auth_msg);
++            int auth_rv = amf_nausf_auth_handle_authenticate(amf_ue, auth_msg);
 +
-+            /* Tell amf-sm.c to resume (it will skip its own dispatch). */
++            /* Tell amf-sm.c to resume (it will skip its own dispatch).
++             * Signal regardless of auth_rv — amf-sm.c is blocked on
++             * send_auth_cond and would deadlock otherwise. */
 +            pthread_mutex_lock(&send_auth_cond_mutex);
 +            pthread_cond_signal(&send_auth_cond);
 +            pthread_mutex_unlock(&send_auth_cond_mutex);
++
++            if (auth_rv != OGS_OK) {
++                /* The NAS Auth Request couldn't be sent (typically because
++                 * the NG context was already removed — e.g. after radio link
++                 * failure between gNB and UE, see nas-path.c:481). Push
++                 * null_action immediately so the testing client doesn't
++                 * have to wait the full read timeout for an auth_response
++                 * that will never arrive. */
++                printf("[amf-socket] !!! amf_nausf_auth_handle_authenticate "
++                       "failed (rv=%d) — sending null_action\n", auth_rv);
++                fflush(stdout);
++                send_message("null_action\n");
++                continue;
++            }
 +
 +            printf("[amf-socket] === Auth Request sent to UE, awaiting response\n");
 +            fflush(stdout);
@@ -2034,3 +2050,20 @@ new file mode 100644
 +void  thr_connect(void);
 +
 +#endif /* OPEN5GS_AMF_SOCKET_H */
+diff --git a/src/amf/nausf-handler.c b/src/amf/nausf-handler.c
+--- a/src/amf/nausf-handler.c
++++ b/src/amf/nausf-handler.c
+@@ -156,7 +156,12 @@
+     ogs_expect(r == OGS_OK);
+     ogs_assert(r != OGS_ERROR);
+ 
+-    return OGS_OK;
++    /* Propagate the actual NAS-send result. Previously this always returned
++     * OGS_OK regardless of `r`, which silently masked failures (e.g. NG
++     * context already removed → OGS_NOTFOUND). Both callers — gmm-sm.c
++     * (auto-flow) and amf-socket.c (testing-client active hook) — already
++     * branch on `rv != OGS_OK`; that branch was just unreachable. */
++    return r;
+ }
+ 
+ int amf_nausf_auth_handle_authenticate_confirmation(
