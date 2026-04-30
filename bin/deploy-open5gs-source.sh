@@ -105,6 +105,7 @@ sudo cp /local/repository/etc/open5gs/* /etc/open5gs/
 sudo systemctl restart open5gs-mmed
 sudo systemctl restart open5gs-sgwcd
 sudo systemctl restart open5gs-smfd
+sudo systemctl restart open5gs-scpd
 sudo systemctl restart open5gs-amfd
 sudo systemctl restart open5gs-sgwud
 sudo systemctl restart open5gs-upfd
