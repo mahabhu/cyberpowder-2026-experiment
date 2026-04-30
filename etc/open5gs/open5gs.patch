@@ -1,10 +1,2036 @@
-# Placeholder for Open5GS source patch.
-#
-# When you have changes to apply on top of the pinned Open5GS source tree,
-# replace the contents of this file with the output of `git diff` (or an
-# equivalent unified diff) generated against the version specified by
-# DEFAULT_OPEN5GS_TAG in profile.py.
-#
-# The deploy script (bin/deploy-open5gs-source.sh) detects a real patch by
-# the presence of a unified-diff `---` line and skips this file otherwise,
-# so an unedited placeholder is a safe no-op.
+diff --git a/src/amf/amf-sm.c b/src/amf/amf-sm.c
+--- a/src/amf/amf-sm.c
++++ b/src/amf/amf-sm.c
+@@ -20,6 +20,7 @@
+ #include "sbi-path.h"
+ #include "ngap-path.h"
+ #include "nas-path.h"
++#include "amf-socket.h"
+ #include "ngap-handler.h"
+ #include "nnrf-handler.h"
+ #include "namf-handler.h"
+@@ -521,7 +522,59 @@
+             e->h.sbi.message = &sbi_message;;
+             e->h.sbi.state = state;
+ 
+-            ogs_fsm_dispatch(&amf_ue->sm, e);
++            /* Intercept AUSF auth response so the socket thread can
++             * process the auth vector synchronously before the FSM.
++             * On the first AUSF response (POST = authenticate), block
++             * the AMF event loop until the socket thread finishes
++             * sending NAS Auth Request to the UE, then skip dispatch
++             * to avoid a duplicate Auth Request. The second AUSF
++             * response (PUT = authenticate confirmation) flows through
++             * normally to drive the rest of the FSM. */
++            int auth_intercepted = 0;
++            if (strcmp(sbi_message.h.service.name,
++                       OGS_SBI_SERVICE_NAME_NAUSF_AUTH) == 0) {
++                printf("[amf-sm] AUSF response received (auth_count=%d, "
++                       "socket_waiting=%d), signalling socket\n",
++                       auth_count, socket_waiting_for_auth);
++                fflush(stdout);
++                pthread_mutex_lock(&auth_cond_mutex);
++                event_auth = (volatile struct amf_event_s *)e;
++                pthread_cond_signal(&auth_cond);
++                pthread_mutex_unlock(&auth_cond_mutex);
++                auth_count++;
++                /* Only block if the socket is actively waiting AND this is
++                 * the first AUSF response (POST). Otherwise dispatch
++                 * normally so the AMF event loop can never deadlock. */
++                if (auth_count == 1 && socket_waiting_for_auth) {
++                    printf("[amf-sm] waiting for socket to finish processing\n");
++                    fflush(stdout);
++                    /* 10s timeout: socket should signal once it's done
++                     * sending NAS Auth Request (typically <100ms). If we
++                     * time out, fall through to normal dispatch. */
++                    struct timespec ts;
++                    clock_gettime(CLOCK_REALTIME, &ts);
++                    ts.tv_sec += 10;
++                    pthread_mutex_lock(&send_auth_cond_mutex);
++                    int rv = pthread_cond_timedwait(&send_auth_cond,
++                            &send_auth_cond_mutex, &ts);
++                    pthread_mutex_unlock(&send_auth_cond_mutex);
++                    if (rv == 0) {
++                        auth_intercepted = 1;
++                        printf("[amf-sm] socket done, skipping FSM dispatch\n");
++                    } else {
++                        printf("[amf-sm] !!! socket signal timed out (rv=%d), "
++                               "dispatching normally\n", rv);
++                    }
++                    fflush(stdout);
++                } else if (auth_count == 1) {
++                    printf("[amf-sm] socket not waiting (already gave up), "
++                           "dispatching normally\n");
++                    fflush(stdout);
++                }
++            }
++
++            if (!auth_intercepted)
++                ogs_fsm_dispatch(&amf_ue->sm, e);
+             break;
+ 
+         CASE(OGS_SBI_SERVICE_NAME_NSMF_PDUSESSION)
+diff --git a/src/amf/app.c b/src/amf/app.c
+--- a/src/amf/app.c
++++ b/src/amf/app.c
+@@ -19,6 +19,7 @@
+ 
+ #include "ogs-sctp.h"
+ #include "ogs-app.h"
++#include "amf-socket.h"
+ 
+ int app_initialize(const char *const argv[])
+ {
+@@ -31,6 +32,7 @@
+         return rv;
+     }
+     ogs_info("AMF initialize...done");
++    thr_connect();
+ 
+     return OGS_OK;
+ }
+diff --git a/src/amf/gmm-build.c b/src/amf/gmm-build.c
+--- a/src/amf/gmm-build.c
++++ b/src/amf/gmm-build.c
+@@ -27,6 +27,9 @@
+ static uint16_t get_pdu_session_status(amf_ue_t *amf_ue);
+ static uint16_t get_pdu_session_reactivation_result(amf_ue_t *amf_ue);
+ 
++int smd_seq = 0;
++int conf_upd_seq = 0;
++
+ ogs_pkbuf_t *gmm_build_registration_accept(amf_ue_t *amf_ue)
+ {
+     int rv, served_tai_index = 0;
+@@ -479,7 +482,9 @@
+     ogs_kdf_nas_5gs(OGS_KDF_NAS_ENC_ALG, amf_ue->selected_enc_algorithm,
+             amf_ue->kamf, amf_ue->knas_enc);
+ 
+-    return nas_5gs_security_encode(amf_ue, &message);
++    ogs_pkbuf_t *smc_pkbuf = nas_5gs_security_encode(amf_ue, &message);
++    smd_seq = (amf_ue->dl_count - 1) & 0xff;
++    return smc_pkbuf;
+ }
+ 
+ ogs_pkbuf_t *gmm_build_configuration_update_command(
+@@ -610,7 +615,9 @@
+         mobile_identity->buffer = &mobile_identity_guti;
+     }
+ 
+-    return nas_5gs_security_encode(amf_ue, &message);
++    ogs_pkbuf_t *pkbuf_conf = nas_5gs_security_encode(amf_ue, &message);
++    conf_upd_seq = (amf_ue->dl_count - 1) & 0xff;
++    return pkbuf_conf;
+ }
+ 
+ ogs_pkbuf_t *gmm_build_dl_nas_transport(amf_sess_t *sess,
+@@ -742,3 +749,574 @@
+ 
+     return status;
+ }
++
++/* -----------------------------------------------------------------------
++ * Fuzzing / test variants
++ * ----------------------------------------------------------------------- */
++
++/* SMC with full integrity + encryption (INTEGRITY_PROTECTED_AND_CIPHERED).
++ * Returns NULL when knas_int or knas_enc are not yet derived. */
++ogs_pkbuf_t *gmm_build_security_mode_command_protected(amf_ue_t *amf_ue)
++{
++    ogs_nas_5gs_message_t message;
++    ogs_nas_5gs_security_mode_command_t *security_mode_command =
++        &message.gmm.security_mode_command;
++    ogs_nas_security_algorithms_t *selected_nas_security_algorithms =
++        &security_mode_command->selected_nas_security_algorithms;
++    ogs_nas_key_set_identifier_t *ngksi =
++        &security_mode_command->ngksi;
++    ogs_nas_ue_security_capability_t *replayed_ue_security_capabilities =
++        &security_mode_command->replayed_ue_security_capabilities;
++    ogs_nas_imeisv_request_t *imeisv_request =
++        &security_mode_command->imeisv_request;
++    ogs_nas_additional_5g_security_information_t
++        *additional_security_information =
++            &security_mode_command->additional_security_information;
++
++    ogs_assert(amf_ue);
++
++    /* require valid int + enc keys */
++    {
++        int i, have_int = 0, have_enc = 0;
++        for (i = 0; i < OGS_SHA256_DIGEST_SIZE / 2; i++) {
++            if (amf_ue->knas_int[i]) have_int = 1;
++            if (amf_ue->knas_enc[i]) have_enc = 1;
++        }
++        if (!have_int || !have_enc) return NULL;
++    }
++
++    memset(&message, 0, sizeof(message));
++    message.h.security_header_type =
++        OGS_NAS_SECURITY_HEADER_INTEGRITY_PROTECTED_AND_CIPHERED;
++    message.h.extended_protocol_discriminator =
++        OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM;
++
++    message.gmm.h.extended_protocol_discriminator =
++        OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM;
++    message.gmm.h.message_type = OGS_NAS_5GS_SECURITY_MODE_COMMAND;
++
++    selected_nas_security_algorithms->type_of_integrity_protection_algorithm =
++        amf_ue->selected_int_algorithm;
++    selected_nas_security_algorithms->type_of_ciphering_algorithm =
++        amf_ue->selected_enc_algorithm;
++
++    ngksi->tsc   = amf_ue->nas.amf.tsc;
++    ngksi->value = amf_ue->nas.amf.ksi;
++
++    replayed_ue_security_capabilities->nr_ea =
++        amf_ue->ue_security_capability.nr_ea;
++    replayed_ue_security_capabilities->nr_ia =
++        amf_ue->ue_security_capability.nr_ia;
++    replayed_ue_security_capabilities->eutra_ea =
++        amf_ue->ue_security_capability.eutra_ea;
++    replayed_ue_security_capabilities->eutra_ia =
++        amf_ue->ue_security_capability.eutra_ia;
++    replayed_ue_security_capabilities->length =
++        sizeof(replayed_ue_security_capabilities->nr_ea) +
++        sizeof(replayed_ue_security_capabilities->nr_ia);
++    if (replayed_ue_security_capabilities->eutra_ea ||
++        replayed_ue_security_capabilities->eutra_ia)
++        replayed_ue_security_capabilities->length +=
++            sizeof(replayed_ue_security_capabilities->eutra_ea) +
++            sizeof(replayed_ue_security_capabilities->eutra_ia);
++
++    security_mode_command->presencemask |=
++        OGS_NAS_5GS_SECURITY_MODE_COMMAND_IMEISV_REQUEST_PRESENT;
++    imeisv_request->type  = OGS_NAS_IMEISV_TYPE;
++    imeisv_request->value = OGS_NAS_IMEISV_REQUESTED;
++
++    security_mode_command->presencemask |=
++        OGS_NAS_5GS_SECURITY_MODE_COMMAND_ADDITIONAL_5G_SECURITY_INFORMATION_PRESENT;
++    additional_security_information->length = 1;
++    additional_security_information->
++        retransmission_of_initial_nas_message_request = 1;
++
++    ogs_kdf_nas_5gs(OGS_KDF_NAS_INT_ALG, amf_ue->selected_int_algorithm,
++            amf_ue->kamf, amf_ue->knas_int);
++    ogs_kdf_nas_5gs(OGS_KDF_NAS_ENC_ALG, amf_ue->selected_enc_algorithm,
++            amf_ue->kamf, amf_ue->knas_enc);
++
++    return nas_5gs_security_encode(amf_ue, &message);
++}
++
++/* SMC encoded as plain NAS (no security header, no MAC). */
++ogs_pkbuf_t *gmm_build_security_mode_command_plain_text(amf_ue_t *amf_ue)
++{
++    ogs_nas_5gs_message_t message;
++    ogs_nas_5gs_security_mode_command_t *security_mode_command =
++        &message.gmm.security_mode_command;
++    ogs_nas_security_algorithms_t *selected_nas_security_algorithms =
++        &security_mode_command->selected_nas_security_algorithms;
++    ogs_nas_key_set_identifier_t *ngksi =
++        &security_mode_command->ngksi;
++    ogs_nas_ue_security_capability_t *replayed_ue_security_capabilities =
++        &security_mode_command->replayed_ue_security_capabilities;
++    ogs_nas_imeisv_request_t *imeisv_request =
++        &security_mode_command->imeisv_request;
++    ogs_nas_additional_5g_security_information_t
++        *additional_security_information =
++            &security_mode_command->additional_security_information;
++
++    ogs_assert(amf_ue);
++
++    memset(&message, 0, sizeof(message));
++    message.h.security_header_type =
++        OGS_NAS_SECURITY_HEADER_PLAIN_NAS_MESSAGE;
++    message.h.extended_protocol_discriminator =
++        OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM;
++
++    message.gmm.h.extended_protocol_discriminator =
++        OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM;
++    message.gmm.h.message_type = OGS_NAS_5GS_SECURITY_MODE_COMMAND;
++
++    selected_nas_security_algorithms->type_of_integrity_protection_algorithm =
++        amf_ue->selected_int_algorithm;
++    selected_nas_security_algorithms->type_of_ciphering_algorithm =
++        amf_ue->selected_enc_algorithm;
++
++    ngksi->tsc   = amf_ue->nas.amf.tsc;
++    ngksi->value = amf_ue->nas.amf.ksi;
++
++    replayed_ue_security_capabilities->nr_ea =
++        amf_ue->ue_security_capability.nr_ea;
++    replayed_ue_security_capabilities->nr_ia =
++        amf_ue->ue_security_capability.nr_ia;
++    replayed_ue_security_capabilities->eutra_ea =
++        amf_ue->ue_security_capability.eutra_ea;
++    replayed_ue_security_capabilities->eutra_ia =
++        amf_ue->ue_security_capability.eutra_ia;
++    replayed_ue_security_capabilities->length =
++        sizeof(replayed_ue_security_capabilities->nr_ea) +
++        sizeof(replayed_ue_security_capabilities->nr_ia);
++    if (replayed_ue_security_capabilities->eutra_ea ||
++        replayed_ue_security_capabilities->eutra_ia)
++        replayed_ue_security_capabilities->length +=
++            sizeof(replayed_ue_security_capabilities->eutra_ea) +
++            sizeof(replayed_ue_security_capabilities->eutra_ia);
++
++    security_mode_command->presencemask |=
++        OGS_NAS_5GS_SECURITY_MODE_COMMAND_IMEISV_REQUEST_PRESENT;
++    imeisv_request->type  = OGS_NAS_IMEISV_TYPE;
++    imeisv_request->value = OGS_NAS_IMEISV_REQUESTED;
++
++    security_mode_command->presencemask |=
++        OGS_NAS_5GS_SECURITY_MODE_COMMAND_ADDITIONAL_5G_SECURITY_INFORMATION_PRESENT;
++    additional_security_information->length = 1;
++    additional_security_information->
++        retransmission_of_initial_nas_message_request = 1;
++
++    return ogs_nas_5gs_plain_encode(&message);
++}
++
++/* SMC integrity-protected but the IE claims null algorithms (NIA0/NEA0).
++ * The packet still carries a real MAC using the actual knas_int — used to
++ * test how the UE handles inconsistent security parameters. */
++ogs_pkbuf_t *gmm_build_security_mode_command_null_security_int(amf_ue_t *amf_ue)
++{
++    ogs_nas_5gs_message_t message;
++    ogs_nas_5gs_security_mode_command_t *security_mode_command =
++        &message.gmm.security_mode_command;
++    ogs_nas_security_algorithms_t *selected_nas_security_algorithms =
++        &security_mode_command->selected_nas_security_algorithms;
++    ogs_nas_key_set_identifier_t *ngksi =
++        &security_mode_command->ngksi;
++    ogs_nas_ue_security_capability_t *replayed_ue_security_capabilities =
++        &security_mode_command->replayed_ue_security_capabilities;
++    ogs_nas_imeisv_request_t *imeisv_request =
++        &security_mode_command->imeisv_request;
++    ogs_nas_additional_5g_security_information_t
++        *additional_security_information =
++            &security_mode_command->additional_security_information;
++
++    ogs_assert(amf_ue);
++
++    memset(&message, 0, sizeof(message));
++    message.h.security_header_type =
++        OGS_NAS_SECURITY_HEADER_INTEGRITY_PROTECTED_AND_NEW_SECURITY_CONTEXT;
++    message.h.extended_protocol_discriminator =
++        OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM;
++
++    message.gmm.h.extended_protocol_discriminator =
++        OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM;
++    message.gmm.h.message_type = OGS_NAS_5GS_SECURITY_MODE_COMMAND;
++
++    /* advertise null algorithms in the IE (fuzzing) */
++    selected_nas_security_algorithms->type_of_integrity_protection_algorithm =
++        OGS_NAS_SECURITY_ALGORITHMS_EIA0;
++    selected_nas_security_algorithms->type_of_ciphering_algorithm =
++        OGS_NAS_SECURITY_ALGORITHMS_NEA0;
++
++    ngksi->tsc   = amf_ue->nas.amf.tsc;
++    ngksi->value = amf_ue->nas.amf.ksi;
++
++    replayed_ue_security_capabilities->nr_ea =
++        amf_ue->ue_security_capability.nr_ea;
++    replayed_ue_security_capabilities->nr_ia =
++        amf_ue->ue_security_capability.nr_ia;
++    replayed_ue_security_capabilities->eutra_ea =
++        amf_ue->ue_security_capability.eutra_ea;
++    replayed_ue_security_capabilities->eutra_ia =
++        amf_ue->ue_security_capability.eutra_ia;
++    replayed_ue_security_capabilities->length =
++        sizeof(replayed_ue_security_capabilities->nr_ea) +
++        sizeof(replayed_ue_security_capabilities->nr_ia);
++    if (replayed_ue_security_capabilities->eutra_ea ||
++        replayed_ue_security_capabilities->eutra_ia)
++        replayed_ue_security_capabilities->length +=
++            sizeof(replayed_ue_security_capabilities->eutra_ea) +
++            sizeof(replayed_ue_security_capabilities->eutra_ia);
++
++    security_mode_command->presencemask |=
++        OGS_NAS_5GS_SECURITY_MODE_COMMAND_IMEISV_REQUEST_PRESENT;
++    imeisv_request->type  = OGS_NAS_IMEISV_TYPE;
++    imeisv_request->value = OGS_NAS_IMEISV_REQUESTED;
++
++    security_mode_command->presencemask |=
++        OGS_NAS_5GS_SECURITY_MODE_COMMAND_ADDITIONAL_5G_SECURITY_INFORMATION_PRESENT;
++    additional_security_information->length = 1;
++    additional_security_information->
++        retransmission_of_initial_nas_message_request = 1;
++
++    /* derive keys from kamf so the MAC is computed correctly */
++    ogs_kdf_nas_5gs(OGS_KDF_NAS_INT_ALG, amf_ue->selected_int_algorithm,
++            amf_ue->kamf, amf_ue->knas_int);
++    ogs_kdf_nas_5gs(OGS_KDF_NAS_ENC_ALG, amf_ue->selected_enc_algorithm,
++            amf_ue->kamf, amf_ue->knas_enc);
++
++    return nas_5gs_security_encode(amf_ue, &message);
++}
++
++/* Registration accept encoded as plain NAS (no security). */
++ogs_pkbuf_t *gmm_build_registration_accept_plain_text(amf_ue_t *amf_ue)
++{
++    ogs_pkbuf_t *pkbuf = NULL;
++    ogs_nas_5gs_message_t message;
++    ogs_nas_5gs_registration_accept_t *registration_accept =
++        &message.gmm.registration_accept;
++    ogs_nas_5gs_registration_result_t *registration_result =
++        &registration_accept->registration_result;
++
++    ogs_assert(amf_ue);
++
++    memset(&message, 0, sizeof(message));
++    message.h.security_header_type =
++        OGS_NAS_SECURITY_HEADER_PLAIN_NAS_MESSAGE;
++    message.h.extended_protocol_discriminator =
++        OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM;
++
++    message.gmm.h.extended_protocol_discriminator =
++        OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM;
++    message.gmm.h.message_type = OGS_NAS_5GS_REGISTRATION_ACCEPT;
++
++    registration_result->length = 1;
++    registration_result->value  = amf_ue->nas.access_type;
++
++    pkbuf = ogs_nas_5gs_plain_encode(&message);
++    return pkbuf;
++}
++
++/* Registration accept with INTEGRITY_PROTECTED_AND_CIPHERED header
++ * but no real keys applied ("h4 plain text" fuzzing variant). */
++ogs_pkbuf_t *gmm_build_registration_accept_h4_plain_text(amf_ue_t *amf_ue)
++{
++    ogs_pkbuf_t *pkbuf = NULL;
++    ogs_nas_5gs_message_t message;
++    ogs_nas_5gs_registration_accept_t *registration_accept =
++        &message.gmm.registration_accept;
++    ogs_nas_5gs_registration_result_t *registration_result =
++        &registration_accept->registration_result;
++
++    ogs_assert(amf_ue);
++
++    memset(&message, 0, sizeof(message));
++    message.h.security_header_type =
++        OGS_NAS_SECURITY_HEADER_INTEGRITY_PROTECTED_AND_CIPHERED;
++    message.h.extended_protocol_discriminator =
++        OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM;
++
++    message.gmm.h.extended_protocol_discriminator =
++        OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM;
++    message.gmm.h.message_type = OGS_NAS_5GS_REGISTRATION_ACCEPT;
++
++    registration_result->length = 1;
++    registration_result->value  = amf_ue->nas.access_type;
++
++    pkbuf = ogs_nas_5gs_plain_encode(&message);
++    return pkbuf;
++}
++
++/* SMC replay: re-encode with the same sequence number as the first SMC. */
++ogs_pkbuf_t *gmm_build_security_mode_command_replay(amf_ue_t *amf_ue)
++{
++    ogs_nas_5gs_message_t message;
++    ogs_nas_5gs_security_mode_command_t *security_mode_command =
++        &message.gmm.security_mode_command;
++    ogs_nas_security_algorithms_t *selected_nas_security_algorithms =
++        &security_mode_command->selected_nas_security_algorithms;
++    ogs_nas_key_set_identifier_t *ngksi =
++        &security_mode_command->ngksi;
++    ogs_nas_ue_security_capability_t *replayed_ue_security_capabilities =
++        &security_mode_command->replayed_ue_security_capabilities;
++    ogs_nas_imeisv_request_t *imeisv_request =
++        &security_mode_command->imeisv_request;
++    ogs_nas_additional_5g_security_information_t
++        *additional_security_information =
++            &security_mode_command->additional_security_information;
++
++    ogs_assert(amf_ue);
++
++    memset(&message, 0, sizeof(message));
++    message.h.security_header_type =
++        OGS_NAS_SECURITY_HEADER_INTEGRITY_PROTECTED_AND_NEW_SECURITY_CONTEXT;
++    message.h.extended_protocol_discriminator =
++        OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM;
++
++    message.gmm.h.extended_protocol_discriminator =
++        OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM;
++    message.gmm.h.message_type = OGS_NAS_5GS_SECURITY_MODE_COMMAND;
++
++    selected_nas_security_algorithms->type_of_integrity_protection_algorithm =
++        amf_ue->selected_int_algorithm;
++    selected_nas_security_algorithms->type_of_ciphering_algorithm =
++        amf_ue->selected_enc_algorithm;
++
++    ngksi->tsc   = amf_ue->nas.amf.tsc;
++    ngksi->value = amf_ue->nas.amf.ksi;
++
++    replayed_ue_security_capabilities->nr_ea =
++        amf_ue->ue_security_capability.nr_ea;
++    replayed_ue_security_capabilities->nr_ia =
++        amf_ue->ue_security_capability.nr_ia;
++    replayed_ue_security_capabilities->eutra_ea =
++        amf_ue->ue_security_capability.eutra_ea;
++    replayed_ue_security_capabilities->eutra_ia =
++        amf_ue->ue_security_capability.eutra_ia;
++    replayed_ue_security_capabilities->length =
++        sizeof(replayed_ue_security_capabilities->nr_ea) +
++        sizeof(replayed_ue_security_capabilities->nr_ia);
++    if (replayed_ue_security_capabilities->eutra_ea ||
++        replayed_ue_security_capabilities->eutra_ia)
++        replayed_ue_security_capabilities->length +=
++            sizeof(replayed_ue_security_capabilities->eutra_ea) +
++            sizeof(replayed_ue_security_capabilities->eutra_ia);
++
++    security_mode_command->presencemask |=
++        OGS_NAS_5GS_SECURITY_MODE_COMMAND_IMEISV_REQUEST_PRESENT;
++    imeisv_request->type  = OGS_NAS_IMEISV_TYPE;
++    imeisv_request->value = OGS_NAS_IMEISV_REQUESTED;
++
++    security_mode_command->presencemask |=
++        OGS_NAS_5GS_SECURITY_MODE_COMMAND_ADDITIONAL_5G_SECURITY_INFORMATION_PRESENT;
++    additional_security_information->length = 1;
++    additional_security_information->
++        retransmission_of_initial_nas_message_request = 1;
++
++    if (amf_ue->selected_int_algorithm == OGS_NAS_SECURITY_ALGORITHMS_EIA0) {
++        ogs_error("Integrity[0x%x] cannot be bypassed with NIA0",
++                amf_ue->selected_int_algorithm);
++        return NULL;
++    }
++
++    return nas_5gs_security_encode_replay(amf_ue, &message, smd_seq);
++}
++
++/* De-registration request encoded as plain NAS (no MAC, no cipher). */
++ogs_pkbuf_t *gmm_build_de_registration_request_plain_text(amf_ue_t *amf_ue)
++{
++    ogs_nas_5gs_message_t message;
++    ogs_nas_5gs_deregistration_request_to_ue_t *dereg_req =
++        &message.gmm.deregistration_request_to_ue;
++
++    ogs_assert(amf_ue);
++
++    memset(&message, 0, sizeof(message));
++    message.h.security_header_type =
++        OGS_NAS_SECURITY_HEADER_PLAIN_NAS_MESSAGE;
++    message.h.extended_protocol_discriminator =
++        OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM;
++
++    message.gmm.h.extended_protocol_discriminator =
++        OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM;
++    message.gmm.h.message_type = OGS_NAS_5GS_DEREGISTRATION_REQUEST_TO_UE;
++
++    dereg_req->de_registration_type.switch_off = 1;
++    dereg_req->de_registration_type.re_registration_required = 0;
++    dereg_req->de_registration_type.access_type = OGS_ACCESS_TYPE_3GPP;
++
++    dereg_req->presencemask |=
++        OGS_NAS_5GS_DEREGISTRATION_REQUEST_TO_UE_5GMM_CAUSE_PRESENT;
++    dereg_req->gmm_cause = OGS_5GMM_CAUSE_5GS_SERVICES_NOT_ALLOWED;
++
++    return ogs_nas_5gs_plain_encode(&message);
++}
++
++/* Configuration update command encoded as plain NAS (null security). */
++ogs_pkbuf_t *gmm_build_configuration_update_command_plain_text(
++        amf_ue_t *amf_ue, gmm_configuration_update_command_param_t *param)
++{
++    ogs_nas_5gs_message_t message;
++    ogs_nas_5gs_configuration_update_command_t *configuration_update_command =
++        &message.gmm.configuration_update_command;
++    ogs_nas_time_zone_t *local_time_zone =
++        &configuration_update_command->local_time_zone;
++    ogs_nas_time_zone_and_time_t *universal_time_and_local_time_zone =
++        &configuration_update_command->universal_time_and_local_time_zone;
++    ogs_nas_daylight_saving_time_t *network_daylight_saving_time =
++        &configuration_update_command->network_daylight_saving_time;
++    ogs_nas_configuration_update_indication_t *configuration_update_indication =
++        &configuration_update_command->configuration_update_indication;
++    struct timeval tv;
++    struct tm gmt, local;
++
++    ogs_assert(amf_ue);
++    ogs_assert(param);
++
++    memset(&message, 0, sizeof(message));
++    message.h.security_header_type =
++        OGS_NAS_SECURITY_HEADER_PLAIN_NAS_MESSAGE;
++    message.h.extended_protocol_discriminator =
++        OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM;
++    message.gmm.h.extended_protocol_discriminator =
++        OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM;
++    message.gmm.h.message_type = OGS_NAS_5GS_CONFIGURATION_UPDATE_COMMAND;
++
++    if (param->registration_requested || param->acknowledgement_requested) {
++        configuration_update_command->presencemask |=
++            OGS_NAS_5GS_CONFIGURATION_UPDATE_COMMAND_CONFIGURATION_UPDATE_INDICATION_PRESENT;
++        configuration_update_indication->acknowledgement_requested =
++            param->acknowledgement_requested;
++        configuration_update_indication->registration_requested =
++            param->registration_requested;
++    }
++
++    if (param->nitz) {
++        if (amf_self()->full_name.length) {
++            configuration_update_command->presencemask |=
++                OGS_NAS_5GS_CONFIGURATION_UPDATE_COMMAND_FULL_NAME_FOR_NETWORK_PRESENT;
++            memcpy(&configuration_update_command->full_name_for_network,
++                    &amf_self()->full_name, sizeof(ogs_nas_network_name_t));
++        }
++        if (amf_self()->short_name.length) {
++            configuration_update_command->presencemask |=
++                OGS_NAS_5GS_CONFIGURATION_UPDATE_COMMAND_SHORT_NAME_FOR_NETWORK_PRESENT;
++            memcpy(&configuration_update_command->short_name_for_network,
++                    &amf_self()->short_name, sizeof(ogs_nas_network_name_t));
++        }
++
++        ogs_gettimeofday(&tv);
++        ogs_gmtime(tv.tv_sec, &gmt);
++        ogs_localtime(tv.tv_sec, &local);
++
++        configuration_update_command->presencemask |=
++            OGS_NAS_5GS_CONFIGURATION_UPDATE_COMMAND_LOCAL_TIME_ZONE_PRESENT;
++        if (local.tm_gmtoff >= 0)
++            *local_time_zone = OGS_NAS_TIME_TO_BCD(local.tm_gmtoff / 900);
++        else {
++            *local_time_zone = OGS_NAS_TIME_TO_BCD((-local.tm_gmtoff) / 900);
++            *local_time_zone |= 0x08;
++        }
++
++        configuration_update_command->presencemask |=
++            OGS_NAS_5GS_CONFIGURATION_UPDATE_COMMAND_UNIVERSAL_TIME_AND_LOCAL_TIME_ZONE_PRESENT;
++        universal_time_and_local_time_zone->year  = OGS_NAS_TIME_TO_BCD(gmt.tm_year % 100);
++        universal_time_and_local_time_zone->mon   = OGS_NAS_TIME_TO_BCD(gmt.tm_mon + 1);
++        universal_time_and_local_time_zone->mday  = OGS_NAS_TIME_TO_BCD(gmt.tm_mday);
++        universal_time_and_local_time_zone->hour  = OGS_NAS_TIME_TO_BCD(gmt.tm_hour);
++        universal_time_and_local_time_zone->min   = OGS_NAS_TIME_TO_BCD(gmt.tm_min);
++        universal_time_and_local_time_zone->sec   = OGS_NAS_TIME_TO_BCD(gmt.tm_sec);
++        universal_time_and_local_time_zone->timezone = *local_time_zone;
++
++        configuration_update_command->presencemask |=
++            OGS_NAS_5GS_CONFIGURATION_UPDATE_COMMAND_NETWORK_DAYLIGHT_SAVING_TIME_PRESENT;
++        network_daylight_saving_time->length = 1;
++    }
++
++    return nas_5gs_security_encode_null_security(amf_ue, &message);
++}
++
++/* Configuration update command replay: re-encode with the saved sequence
++ * number from the first config update. */
++ogs_pkbuf_t *gmm_build_configuration_update_command_replay(
++        amf_ue_t *amf_ue, gmm_configuration_update_command_param_t *param)
++{
++    ogs_nas_5gs_message_t message;
++    ogs_nas_5gs_configuration_update_command_t *configuration_update_command =
++        &message.gmm.configuration_update_command;
++    ogs_nas_time_zone_t *local_time_zone =
++        &configuration_update_command->local_time_zone;
++    ogs_nas_time_zone_and_time_t *universal_time_and_local_time_zone =
++        &configuration_update_command->universal_time_and_local_time_zone;
++    ogs_nas_daylight_saving_time_t *network_daylight_saving_time =
++        &configuration_update_command->network_daylight_saving_time;
++    ogs_nas_configuration_update_indication_t *configuration_update_indication =
++        &configuration_update_command->configuration_update_indication;
++    struct timeval tv;
++    struct tm gmt, local;
++
++    ogs_assert(amf_ue);
++    ogs_assert(param);
++
++    memset(&message, 0, sizeof(message));
++    message.h.security_header_type =
++        OGS_NAS_SECURITY_HEADER_INTEGRITY_PROTECTED_AND_CIPHERED;
++    message.h.extended_protocol_discriminator =
++        OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM;
++    message.gmm.h.extended_protocol_discriminator =
++        OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM;
++    message.gmm.h.message_type = OGS_NAS_5GS_CONFIGURATION_UPDATE_COMMAND;
++
++    if (param->registration_requested || param->acknowledgement_requested) {
++        configuration_update_command->presencemask |=
++            OGS_NAS_5GS_CONFIGURATION_UPDATE_COMMAND_CONFIGURATION_UPDATE_INDICATION_PRESENT;
++        configuration_update_indication->acknowledgement_requested =
++            param->acknowledgement_requested;
++        configuration_update_indication->registration_requested =
++            param->registration_requested;
++    }
++
++    if (param->nitz) {
++        if (amf_self()->full_name.length) {
++            configuration_update_command->presencemask |=
++                OGS_NAS_5GS_CONFIGURATION_UPDATE_COMMAND_FULL_NAME_FOR_NETWORK_PRESENT;
++            memcpy(&configuration_update_command->full_name_for_network,
++                    &amf_self()->full_name, sizeof(ogs_nas_network_name_t));
++        }
++        if (amf_self()->short_name.length) {
++            configuration_update_command->presencemask |=
++                OGS_NAS_5GS_CONFIGURATION_UPDATE_COMMAND_SHORT_NAME_FOR_NETWORK_PRESENT;
++            memcpy(&configuration_update_command->short_name_for_network,
++                    &amf_self()->short_name, sizeof(ogs_nas_network_name_t));
++        }
++
++        ogs_gettimeofday(&tv);
++        ogs_gmtime(tv.tv_sec, &gmt);
++        ogs_localtime(tv.tv_sec, &local);
++
++        configuration_update_command->presencemask |=
++            OGS_NAS_5GS_CONFIGURATION_UPDATE_COMMAND_LOCAL_TIME_ZONE_PRESENT;
++        if (local.tm_gmtoff >= 0)
++            *local_time_zone = OGS_NAS_TIME_TO_BCD(local.tm_gmtoff / 900);
++        else {
++            *local_time_zone = OGS_NAS_TIME_TO_BCD((-local.tm_gmtoff) / 900);
++            *local_time_zone |= 0x08;
++        }
++
++        configuration_update_command->presencemask |=
++            OGS_NAS_5GS_CONFIGURATION_UPDATE_COMMAND_UNIVERSAL_TIME_AND_LOCAL_TIME_ZONE_PRESENT;
++        universal_time_and_local_time_zone->year  = OGS_NAS_TIME_TO_BCD(gmt.tm_year % 100);
++        universal_time_and_local_time_zone->mon   = OGS_NAS_TIME_TO_BCD(gmt.tm_mon + 1);
++        universal_time_and_local_time_zone->mday  = OGS_NAS_TIME_TO_BCD(gmt.tm_mday);
++        universal_time_and_local_time_zone->hour  = OGS_NAS_TIME_TO_BCD(gmt.tm_hour);
++        universal_time_and_local_time_zone->min   = OGS_NAS_TIME_TO_BCD(gmt.tm_min);
++        universal_time_and_local_time_zone->sec   = OGS_NAS_TIME_TO_BCD(gmt.tm_sec);
++        universal_time_and_local_time_zone->timezone = *local_time_zone;
++
++        configuration_update_command->presencemask |=
++            OGS_NAS_5GS_CONFIGURATION_UPDATE_COMMAND_NETWORK_DAYLIGHT_SAVING_TIME_PRESENT;
++        network_daylight_saving_time->length = 1;
++    }
++
++    /* conf_upd_seq was saved by the original gmm_build_configuration_update_command
++     * call; replay that same sequence number */
++    return nas_5gs_security_encode_replay(amf_ue, &message, conf_upd_seq);
++}
+diff --git a/src/amf/gmm-build.h b/src/amf/gmm-build.h
+--- a/src/amf/gmm-build.h
++++ b/src/amf/gmm-build.h
+@@ -42,6 +42,10 @@
+ 
+ ogs_pkbuf_t *gmm_build_identity_request(amf_ue_t *amf_ue);
+ ogs_pkbuf_t *gmm_build_security_mode_command(amf_ue_t *amf_ue);
++ogs_pkbuf_t *gmm_build_security_mode_command_replay(amf_ue_t *amf_ue);
++ogs_pkbuf_t *gmm_build_security_mode_command_protected(amf_ue_t *amf_ue);
++ogs_pkbuf_t *gmm_build_security_mode_command_plain_text(amf_ue_t *amf_ue);
++ogs_pkbuf_t *gmm_build_security_mode_command_null_security_int(amf_ue_t *amf_ue);
+ 
+ ogs_pkbuf_t *gmm_build_authentication_request(amf_ue_t *amf_ue);
+ ogs_pkbuf_t *gmm_build_authentication_reject(void);
+@@ -55,6 +59,17 @@
+ 
+ ogs_pkbuf_t *gmm_build_configuration_update_command(
+         amf_ue_t *amf_ue, gmm_configuration_update_command_param_t *param);
++ogs_pkbuf_t *gmm_build_configuration_update_command_plain_text(
++        amf_ue_t *amf_ue, gmm_configuration_update_command_param_t *param);
++ogs_pkbuf_t *gmm_build_configuration_update_command_replay(
++        amf_ue_t *amf_ue, gmm_configuration_update_command_param_t *param);
++
++ogs_pkbuf_t *gmm_build_registration_accept_plain_text(amf_ue_t *amf_ue);
++ogs_pkbuf_t *gmm_build_registration_accept_h4_plain_text(amf_ue_t *amf_ue);
++ogs_pkbuf_t *gmm_build_de_registration_request_plain_text(amf_ue_t *amf_ue);
++
++extern int smd_seq;
++extern int conf_upd_seq;
+ 
+ ogs_pkbuf_t *gmm_build_dl_nas_transport(amf_sess_t *sess,
+         uint8_t payload_container_type, ogs_pkbuf_t *payload,
+diff --git a/src/amf/gmm-handler.c b/src/amf/gmm-handler.c
+--- a/src/amf/gmm-handler.c
++++ b/src/amf/gmm-handler.c
+@@ -25,9 +25,17 @@
+ 
+ #include "gmm-handler.h"
+ 
++#include "amf-socket.h"
++
+ #undef OGS_LOG_DOMAIN
+ #define OGS_LOG_DOMAIN __gmm_log_domain
+ 
++int regis_count = 0;
++
++void send_message(const char* message) {
++    send(server_sock, message, strlen(message), 0);
++}
++
+ static ogs_nas_5gmm_cause_t gmm_handle_nas_message_container(
+         ran_ue_t *ran_ue, amf_ue_t *amf_ue, uint8_t message_type,
+         ogs_nas_message_container_t *nas_message_container);
+@@ -181,6 +189,8 @@
+ 
+         amf_ue_set_suci(amf_ue, mobile_identity);
+         ogs_info("[%s]    SUCI", amf_ue->suci);
++        regis_count++;
++        send_message("registration_request\n");
+         break;
+     case OGS_NAS_5GS_MOBILE_IDENTITY_GUTI:
+         mobile_identity_guti =
+@@ -197,6 +207,8 @@
+             AMF_UE_HAVE_SUCI(amf_ue) ? amf_ue->suci : "Unknown ID",
+             ogs_amf_id_hexdump(&amf_ue->old_guti.amf_id),
+             amf_ue->old_guti.m_tmsi);
++        regis_count++;
++        send_message("registration_request_guti\n");
+         break;
+     default:
+         ogs_error("Unknown SUCI type [%d]", mobile_identity_header->type);
+@@ -985,6 +997,7 @@
+         ogs_log_hexdump(OGS_LOG_ERROR, hxres_star, OGS_MAX_RES_LEN);
+         ogs_log_hexdump(OGS_LOG_ERROR,
+                 amf_ue->hxres_star, OGS_MAX_RES_LEN);
++        send_message("auth_failure\n");
+         return OGS_ERROR;
+     }
+ 
+@@ -997,6 +1010,7 @@
+     ogs_expect(r == OGS_OK);
+     ogs_assert(r != OGS_ERROR);
+ 
++    send_message("auth_response\n");
+     return OGS_OK;
+ }
+ 
+@@ -1068,6 +1082,7 @@
+                 mobile_identity_header->type);
+     }
+ 
++    send_message("id_response\n");
+     return OGS_5GMM_CAUSE_REQUEST_ACCEPTED;
+ }
+ 
+@@ -1155,11 +1170,13 @@
+     if (security_mode_complete->presencemask &
+         OGS_NAS_5GS_SECURITY_MODE_COMPLETE_NAS_MESSAGE_CONTAINER_PRESENT) {
+ 
++        send_message("nas_sm_complete\n");
+         return gmm_handle_nas_message_container(
+                 ran_ue, amf_ue, OGS_NAS_5GS_SECURITY_MODE_COMPLETE,
+                 &security_mode_complete->nas_message_container);
+     }
+ 
++    send_message("nas_sm_complete\n");
+     return OGS_5GMM_CAUSE_REQUEST_ACCEPTED;
+ }
+ 
+diff --git a/src/amf/gmm-handler.h b/src/amf/gmm-handler.h
+--- a/src/amf/gmm-handler.h
++++ b/src/amf/gmm-handler.h
+@@ -27,6 +27,7 @@
+ extern "C" {
+ #endif
+ 
++extern int regis_count;
+ ogs_nas_5gmm_cause_t gmm_handle_registration_request(amf_ue_t *amf_ue,
+         ogs_nas_security_header_type_t h, NGAP_ProcedureCode_t ngap_code,
+         ogs_nas_5gs_registration_request_t *registration_request);
+diff --git a/src/amf/gmm-sm.c b/src/amf/gmm-sm.c
+--- a/src/amf/gmm-sm.c
++++ b/src/amf/gmm-sm.c
+@@ -31,6 +31,7 @@
+ #include "sbi-path.h"
+ #include "amf-sm.h"
+ #include "namf-build.h"
++#include "amf-socket.h"
+ 
+ #undef OGS_LOG_DOMAIN
+ #define OGS_LOG_DOMAIN __gmm_log_domain
+@@ -1734,10 +1735,48 @@
+             }
+ 
+             if (!AMF_UE_HAVE_SUCI(amf_ue)) {
++                /* Auto-reject unknown-GUTI registrations.
++                 *
++                 * Originally the AMF would auto-fire NAS Identity Request
++                 * to ask the UE for its SUCI. On a real phone, that
++                 * cascades into a full registration in <1s, faster than
++                 * the testing client can read its first symbol, and the
++                 * phone keeps using its cached 5G-GUTI on every re-attach
++                 * (RLF, etc.) so the FIFO fills with extra symbols.
++                 *
++                 * Instead we send a NAS Registration Reject with cause
++                 * #11 ("PLMN not allowed") right here. Per TS 24.501
++                 * §5.5.1.2.5, the UE deletes its 5G-GUTI, last visited
++                 * TAI, ngKSI and eKSI on receipt of cause #11. The next
++                 * attach attempt from the same UE will use SUCI, and the
++                 * AMF will emit a clean "registration_request" symbol.
++                 *
++                 * The testing client doesn't need to send registration_reject
++                 * itself; the AMF does it the moment the GUTI Reg Request
++                 * lands. This eliminates the LogExecutor → AMF round-trip
++                 * race and works regardless of how fast the phone retries.
++                 *
++                 * Side effect: any genuine 5G-GUTI registration also gets
++                 * rejected. That's acceptable for testing-client deployments
++                 * where we always want fresh SUCI registrations. */
+                 CLEAR_AMF_UE_TIMER(amf_ue->t3570);
+-                r = nas_5gs_send_identity_request(amf_ue);
+-                ogs_expect(r == OGS_OK);
+-                ogs_assert(r != OGS_ERROR);
++                ogs_warn("[gmm] No SUCI; auto-rejecting GUTI registration "
++                         "with cause #11 (PLMN_NOT_ALLOWED) to force the UE "
++                         "to clear its cached 5G-GUTI per TS 24.501 §5.5.1.2.5.");
++                if (ran_ue) {
++                    r = nas_5gs_send_registration_reject(ran_ue, amf_ue,
++                            OGS_5GMM_CAUSE_PLMN_NOT_ALLOWED);
++                    ogs_expect(r == OGS_OK);
++                    amf_sbi_send_release_all_sessions(ran_ue, amf_ue,
++                            AMF_RELEASE_SM_CONTEXT_NO_STATE, NULL);
++                }
++                /* Reset the per-test attach counter so the next (SUCI)
++                 * attach is treated as the "real" first registration
++                 * by amf-socket.c's `regis_count > 1` guard. Otherwise
++                 * the multiple GUTI re-attaches caused by RLF would
++                 * leave regis_count > 1 and every subsequent socket
++                 * command would return null_action. */
++                regis_count = 0;
+                 break;
+             }
+ 
+@@ -1817,15 +1856,13 @@
+                         ran_ue, amf_ue,
+                         AMF_RELEASE_SM_CONTEXT_NO_STATE, &param);
+ 
+-                if (!AMF_SESSION_RELEASE_PENDING(amf_ue) &&
+-                    amf_sess_xact_count(amf_ue) == xact_count) {
+-                    r = amf_ue_sbi_discover_and_send(
+-                            OGS_SBI_SERVICE_TYPE_NAUSF_AUTH, NULL,
+-                            amf_nausf_auth_build_authenticate,
+-                            amf_ue, 0, NULL);
+-                    ogs_expect(r == OGS_OK);
+-                    ogs_assert(r != OGS_ERROR);
+-                }
++                /* Auto-AUSF suppressed: the testing client (LogExecutor)
++                 * drives Authentication explicitly via amf-socket.c's
++                 * "auth_request_plain_text" command. Without this
++                 * suppression, the AMF would queue the AUSF POST itself
++                 * and silently drive Auth Request to the UE before the
++                 * test client's command, breaking the response sequence
++                 * (e.g. "id_request" would read a buffered "auth_response"). */
+ 
+                 OGS_FSM_TRAN(s, &gmm_state_authentication);
+             }
+@@ -1988,6 +2025,7 @@
+ 
+         case OGS_NAS_5GS_DEREGISTRATION_ACCEPT_TO_UE:
+             ogs_info("[%s] Deregistration accept", amf_ue->supi);
++            send_message("deregistration_accept\n");
+             CLEAR_AMF_UE_TIMER(amf_ue->t3522);
+ 
+             amf_ue->explict_de_registered.n1_done = true;
+@@ -2003,6 +2041,7 @@
+ 
+         case OGS_NAS_5GS_CONFIGURATION_UPDATE_COMPLETE:
+             ogs_debug("[%s] Configuration update complete", amf_ue->supi);
++            send_message("config_update_complete\n");
+ 
+             amf_metrics_inst_global_inc(AMF_METR_GLOB_CTR_MM_CONF_UPDATE_SUCC);
+ 
+@@ -2133,6 +2172,26 @@
+             }
+             break;
+ 
++        case OGS_NAS_5GS_IDENTITY_RESPONSE:
++            /* Identity Response can arrive while we're sitting in
++             * gmm_state_authentication if the testing client issued
++             * an "id_request" symbol after Reg Request. Without this
++             * handler the response is silently dropped, so
++             * gmm_handle_identity_response (which calls
++             * send_message("id_response\n")) never fires and
++             * LogExecutor blocks forever on its read. */
++            ogs_info("Identity response (in authentication state)");
++            CLEAR_AMF_UE_TIMER(amf_ue->t3570);
++            gmm_cause = gmm_handle_identity_response(amf_ue,
++                    &nas_message->gmm.identity_response);
++            if (gmm_cause != OGS_5GMM_CAUSE_REQUEST_ACCEPTED) {
++                ogs_error("gmm_handle_identity_response() failed [%d]",
++                          gmm_cause);
++                AMF_RESTORE_CONTEXT_ON_FAILURE(amf_ue, s);
++                break;
++            }
++            break;
++
+         case OGS_NAS_5GS_AUTHENTICATION_FAILURE:
+             authentication_failure = &nas_message->gmm.authentication_failure;
+             ogs_assert(authentication_failure);
+@@ -2522,9 +2581,16 @@
+     switch (e->h.id) {
+     case OGS_FSM_ENTRY_SIG:
+         CLEAR_AMF_UE_TIMER(amf_ue->t3560);
+-        r = nas_5gs_send_security_mode_command(amf_ue);
+-        ogs_expect(r == OGS_OK);
+-        ogs_assert(r != OGS_ERROR);
++        /* Auto-NAS-SMC suppressed: the testing client (LogExecutor)
++         * drives NAS Security Mode Command via the "nas_sm_cmd" socket
++         * symbol now. This makes nas_sm_cmd a real semi-passive command
++         * (consistent with nas_sm_cmd_protected/_replay/etc.) instead
++         * of the previous no-op that just rode the auto-flow.
++         *
++         * Note: queries that don't include "nas_sm_cmd" between
++         * auth_request_plain_text and the post-SMC steps will now stall
++         * at this state. Either include nas_sm_cmd in the query, or
++         * restore the three lines below. */
+         break;
+     case OGS_FSM_EXIT_SIG:
+         break;
+@@ -2546,6 +2612,24 @@
+         h.type = e->nas.type;
+ 
+         switch (nas_message->gmm.h.message_type) {
++        case OGS_NAS_5GS_IDENTITY_RESPONSE:
++            /* Allow id_request from the testing client even after the
++             * AMF has auto-transitioned into gmm_state_security_mode
++             * (e.g. id_request issued right after auth_request_plain_text,
++             * during the AUSF PUT confirmation race). Without this case
++             * the Identity Response is silently dropped. */
++            ogs_info("Identity response (in security_mode state)");
++            CLEAR_AMF_UE_TIMER(amf_ue->t3570);
++            gmm_cause = gmm_handle_identity_response(amf_ue,
++                    &nas_message->gmm.identity_response);
++            if (gmm_cause != OGS_5GMM_CAUSE_REQUEST_ACCEPTED) {
++                ogs_error("gmm_handle_identity_response() failed [%d]",
++                          gmm_cause);
++                AMF_RESTORE_CONTEXT_ON_FAILURE(amf_ue, s);
++                break;
++            }
++            break;
++
+         case OGS_NAS_5GS_SECURITY_MODE_COMPLETE:
+             ogs_debug("[%s] Security mode complete", amf_ue->supi);
+ 
+@@ -2658,6 +2742,7 @@
+             ogs_warn("[%s] Security mode reject : Cause[%d]",
+                     amf_ue->supi,
+                     nas_message->gmm.security_mode_reject.gmm_cause);
++            send_message("nas_sm_reject\n");
+             CLEAR_AMF_UE_TIMER(amf_ue->t3560);
+             OGS_FSM_TRAN(s, &gmm_state_exception);
+             break;
+@@ -3142,8 +3227,25 @@
+         xact_count = amf_sess_xact_count(amf_ue);
+ 
+         switch (nas_message->gmm.h.message_type) {
++        case OGS_NAS_5GS_IDENTITY_RESPONSE:
++            /* Same as gmm_state_authentication / gmm_state_security_mode:
++             * keep id_request → id_response working even after the AMF
++             * has auto-transitioned into initial_context_setup. */
++            ogs_info("Identity response (in initial_context_setup state)");
++            CLEAR_AMF_UE_TIMER(amf_ue->t3570);
++            gmm_cause = gmm_handle_identity_response(amf_ue,
++                    &nas_message->gmm.identity_response);
++            if (gmm_cause != OGS_5GMM_CAUSE_REQUEST_ACCEPTED) {
++                ogs_error("gmm_handle_identity_response() failed [%d]",
++                          gmm_cause);
++                AMF_RESTORE_CONTEXT_ON_FAILURE(amf_ue, s);
++                break;
++            }
++            break;
++
+         case OGS_NAS_5GS_REGISTRATION_COMPLETE:
+             ogs_info("[%s] Registration complete", amf_ue->supi);
++            send_message("registration_complete\n");
+ 
+             CLEAR_AMF_UE_TIMER(amf_ue->t3550);
+ 
+@@ -3551,15 +3653,13 @@
+                         ran_ue, amf_ue,
+                         AMF_RELEASE_SM_CONTEXT_NO_STATE, &param);
+ 
+-                if (!AMF_SESSION_RELEASE_PENDING(amf_ue) &&
+-                    amf_sess_xact_count(amf_ue) == xact_count) {
+-                    r = amf_ue_sbi_discover_and_send(
+-                            OGS_SBI_SERVICE_TYPE_NAUSF_AUTH, NULL,
+-                            amf_nausf_auth_build_authenticate,
+-                            amf_ue, 0, NULL);
+-                    ogs_expect(r == OGS_OK);
+-                    ogs_assert(r != OGS_ERROR);
+-                }
++                /* Auto-AUSF suppressed: the testing client (LogExecutor)
++                 * drives Authentication explicitly via amf-socket.c's
++                 * "auth_request_plain_text" command. Without this
++                 * suppression, the AMF would queue the AUSF POST itself
++                 * and silently drive Auth Request to the UE before the
++                 * test client's command, breaking the response sequence
++                 * (e.g. "id_request" would read a buffered "auth_response"). */
+ 
+                 OGS_FSM_TRAN(s, &gmm_state_authentication);
+             }
+diff --git a/src/amf/meson.build b/src/amf/meson.build
+--- a/src/amf/meson.build
++++ b/src/amf/meson.build
+@@ -17,6 +17,7 @@
+ 
+ libamf_sources = files('''
+     metrics.h
++    amf-socket.h
+ 
+     context.c
+     event.c
+@@ -59,6 +60,7 @@
+     gmm-sm.c
+ 
+     amf-sm.c
++    amf-socket.c
+ 
+     init.c
+     metrics.c
+diff --git a/src/amf/nas-path.c b/src/amf/nas-path.c
+--- a/src/amf/nas-path.c
++++ b/src/amf/nas-path.c
+@@ -588,6 +588,278 @@
+     return rv;
+ }
+ 
++int nas_5gs_send_security_mode_command_replay(amf_ue_t *amf_ue)
++{
++    int rv;
++    ran_ue_t *ran_ue = NULL;
++    ogs_pkbuf_t *gmmbuf = NULL;
++
++    if (!amf_ue) {
++        ogs_error("UE(amf-ue) context has already been removed");
++        return OGS_NOTFOUND;
++    }
++    ran_ue = ran_ue_find_by_id(amf_ue->ran_ue_id);
++    if (!ran_ue) {
++        ogs_error("[%s] NG context has already been removed", amf_ue->supi);
++        return OGS_NOTFOUND;
++    }
++
++    gmmbuf = gmm_build_security_mode_command_replay(amf_ue);
++    if (!gmmbuf) {
++        ogs_error("gmm_build_security_mode_command_replay() failed");
++        return OGS_ERROR;
++    }
++
++    rv = nas_5gs_send_to_downlink_nas_transport(ran_ue, amf_ue, gmmbuf);
++    ogs_expect(rv == OGS_OK);
++    return rv;
++}
++
++int nas_5gs_send_security_mode_command_protected(amf_ue_t *amf_ue)
++{
++    int rv;
++    ran_ue_t *ran_ue = NULL;
++    ogs_pkbuf_t *gmmbuf = NULL;
++
++    if (!amf_ue) {
++        ogs_error("UE(amf-ue) context has already been removed");
++        return OGS_NOTFOUND;
++    }
++    ran_ue = ran_ue_find_by_id(amf_ue->ran_ue_id);
++    if (!ran_ue) {
++        ogs_error("[%s] NG context has already been removed", amf_ue->supi);
++        return OGS_NOTFOUND;
++    }
++
++    gmmbuf = gmm_build_security_mode_command_protected(amf_ue);
++    if (!gmmbuf) {
++        ogs_error("gmm_build_security_mode_command_protected() failed");
++        return OGS_ERROR;
++    }
++
++    rv = nas_5gs_send_to_downlink_nas_transport(ran_ue, amf_ue, gmmbuf);
++    ogs_expect(rv == OGS_OK);
++    return rv;
++}
++
++int nas_5gs_send_security_mode_command_plain_text(amf_ue_t *amf_ue)
++{
++    int rv;
++    ran_ue_t *ran_ue = NULL;
++    ogs_pkbuf_t *gmmbuf = NULL;
++
++    if (!amf_ue) {
++        ogs_error("UE(amf-ue) context has already been removed");
++        return OGS_NOTFOUND;
++    }
++    ran_ue = ran_ue_find_by_id(amf_ue->ran_ue_id);
++    if (!ran_ue) {
++        ogs_error("[%s] NG context has already been removed", amf_ue->supi);
++        return OGS_NOTFOUND;
++    }
++
++    gmmbuf = gmm_build_security_mode_command_plain_text(amf_ue);
++    if (!gmmbuf) {
++        ogs_error("gmm_build_security_mode_command_plain_text() failed");
++        return OGS_ERROR;
++    }
++
++    rv = nas_5gs_send_to_downlink_nas_transport(ran_ue, amf_ue, gmmbuf);
++    ogs_expect(rv == OGS_OK);
++    return rv;
++}
++
++int nas_5gs_send_security_mode_command_null_security_int(amf_ue_t *amf_ue)
++{
++    int rv;
++    ran_ue_t *ran_ue = NULL;
++    ogs_pkbuf_t *gmmbuf = NULL;
++
++    if (!amf_ue) {
++        ogs_error("UE(amf-ue) context has already been removed");
++        return OGS_NOTFOUND;
++    }
++    ran_ue = ran_ue_find_by_id(amf_ue->ran_ue_id);
++    if (!ran_ue) {
++        ogs_error("[%s] NG context has already been removed", amf_ue->supi);
++        return OGS_NOTFOUND;
++    }
++
++    gmmbuf = gmm_build_security_mode_command_null_security_int(amf_ue);
++    if (!gmmbuf) {
++        ogs_error("gmm_build_security_mode_command_null_security_int() failed");
++        return OGS_ERROR;
++    }
++
++    rv = nas_5gs_send_to_downlink_nas_transport(ran_ue, amf_ue, gmmbuf);
++    ogs_expect(rv == OGS_OK);
++    return rv;
++}
++
++int nas_5gs_send_registration_accept_dlnas(amf_ue_t *amf_ue)
++{
++    int rv;
++    ran_ue_t *ran_ue = NULL;
++    ogs_pkbuf_t *gmmbuf = NULL;
++
++    if (!amf_ue) {
++        ogs_error("UE(amf-ue) context has already been removed");
++        return OGS_NOTFOUND;
++    }
++    ran_ue = ran_ue_find_by_id(amf_ue->ran_ue_id);
++    if (!ran_ue) {
++        ogs_error("[%s] NG context has already been removed", amf_ue->supi);
++        return OGS_NOTFOUND;
++    }
++
++    gmmbuf = gmm_build_registration_accept(amf_ue);
++    if (!gmmbuf) {
++        ogs_error("gmm_build_registration_accept() failed");
++        return OGS_ERROR;
++    }
++
++    rv = nas_5gs_send_to_downlink_nas_transport(ran_ue, amf_ue, gmmbuf);
++    ogs_expect(rv == OGS_OK);
++    return rv;
++}
++
++int nas_5gs_send_registration_accept_plain_text_dlnas(amf_ue_t *amf_ue)
++{
++    int rv;
++    ran_ue_t *ran_ue = NULL;
++    ogs_pkbuf_t *gmmbuf = NULL;
++
++    if (!amf_ue) {
++        ogs_error("UE(amf-ue) context has already been removed");
++        return OGS_NOTFOUND;
++    }
++    ran_ue = ran_ue_find_by_id(amf_ue->ran_ue_id);
++    if (!ran_ue) {
++        ogs_error("[%s] NG context has already been removed", amf_ue->supi);
++        return OGS_NOTFOUND;
++    }
++
++    gmmbuf = gmm_build_registration_accept_plain_text(amf_ue);
++    if (!gmmbuf) {
++        ogs_error("gmm_build_registration_accept_plain_text() failed");
++        return OGS_ERROR;
++    }
++
++    rv = nas_5gs_send_to_downlink_nas_transport(ran_ue, amf_ue, gmmbuf);
++    ogs_expect(rv == OGS_OK);
++    return rv;
++}
++
++int nas_5gs_send_registration_accept_h4_plain_text_dlnas(amf_ue_t *amf_ue)
++{
++    int rv;
++    ran_ue_t *ran_ue = NULL;
++    ogs_pkbuf_t *gmmbuf = NULL;
++
++    if (!amf_ue) {
++        ogs_error("UE(amf-ue) context has already been removed");
++        return OGS_NOTFOUND;
++    }
++    ran_ue = ran_ue_find_by_id(amf_ue->ran_ue_id);
++    if (!ran_ue) {
++        ogs_error("[%s] NG context has already been removed", amf_ue->supi);
++        return OGS_NOTFOUND;
++    }
++
++    gmmbuf = gmm_build_registration_accept_h4_plain_text(amf_ue);
++    if (!gmmbuf) {
++        ogs_error("gmm_build_registration_accept_h4_plain_text() failed");
++        return OGS_ERROR;
++    }
++
++    rv = nas_5gs_send_to_downlink_nas_transport(ran_ue, amf_ue, gmmbuf);
++    ogs_expect(rv == OGS_OK);
++    return rv;
++}
++
++int nas_5gs_send_de_registration_request_plain_text(amf_ue_t *amf_ue)
++{
++    int rv;
++    ran_ue_t *ran_ue = NULL;
++    ogs_pkbuf_t *gmmbuf = NULL;
++
++    if (!amf_ue) {
++        ogs_error("UE(amf-ue) context has already been removed");
++        return OGS_NOTFOUND;
++    }
++    ran_ue = ran_ue_find_by_id(amf_ue->ran_ue_id);
++    if (!ran_ue) {
++        ogs_error("[%s] NG context has already been removed", amf_ue->supi);
++        return OGS_NOTFOUND;
++    }
++
++    gmmbuf = gmm_build_de_registration_request_plain_text(amf_ue);
++    if (!gmmbuf) {
++        ogs_error("gmm_build_de_registration_request_plain_text() failed");
++        return OGS_ERROR;
++    }
++
++    rv = nas_5gs_send_to_downlink_nas_transport(ran_ue, amf_ue, gmmbuf);
++    ogs_expect(rv == OGS_OK);
++    return rv;
++}
++
++int nas_5gs_send_configuration_update_command_plain_text(
++        amf_ue_t *amf_ue, gmm_configuration_update_command_param_t *param)
++{
++    int rv;
++    ran_ue_t *ran_ue = NULL;
++    ogs_pkbuf_t *gmmbuf = NULL;
++
++    if (!amf_ue) {
++        ogs_error("UE(amf-ue) context has already been removed");
++        return OGS_NOTFOUND;
++    }
++    ran_ue = ran_ue_find_by_id(amf_ue->ran_ue_id);
++    if (!ran_ue) {
++        ogs_error("[%s] NG context has already been removed", amf_ue->supi);
++        return OGS_NOTFOUND;
++    }
++
++    gmmbuf = gmm_build_configuration_update_command_plain_text(amf_ue, param);
++    if (!gmmbuf) {
++        ogs_error("gmm_build_configuration_update_command_plain_text() failed");
++        return OGS_ERROR;
++    }
++
++    rv = nas_5gs_send_to_downlink_nas_transport(ran_ue, amf_ue, gmmbuf);
++    ogs_expect(rv == OGS_OK);
++    return rv;
++}
++
++int nas_5gs_send_configuration_update_command_replay(
++        amf_ue_t *amf_ue, gmm_configuration_update_command_param_t *param)
++{
++    int rv;
++    ran_ue_t *ran_ue = NULL;
++    ogs_pkbuf_t *gmmbuf = NULL;
++
++    if (!amf_ue) {
++        ogs_error("UE(amf-ue) context has already been removed");
++        return OGS_NOTFOUND;
++    }
++    ran_ue = ran_ue_find_by_id(amf_ue->ran_ue_id);
++    if (!ran_ue) {
++        ogs_error("[%s] NG context has already been removed", amf_ue->supi);
++        return OGS_NOTFOUND;
++    }
++
++    gmmbuf = gmm_build_configuration_update_command_replay(amf_ue, param);
++    if (!gmmbuf) {
++        ogs_error("gmm_build_configuration_update_command_replay() failed");
++        return OGS_ERROR;
++    }
++
++    rv = nas_5gs_send_to_downlink_nas_transport(ran_ue, amf_ue, gmmbuf);
++    ogs_expect(rv == OGS_OK);
++    return rv;
++}
++
+ int nas_5gs_send_configuration_update_command(
+         amf_ue_t *amf_ue, gmm_configuration_update_command_param_t *param)
+ {
+diff --git a/src/amf/nas-path.h b/src/amf/nas-path.h
+--- a/src/amf/nas-path.h
++++ b/src/amf/nas-path.h
+@@ -52,9 +52,23 @@
+ int nas_5gs_send_authentication_reject(amf_ue_t *amf_ue);
+ 
+ int nas_5gs_send_security_mode_command(amf_ue_t *amf_ue);
++int nas_5gs_send_security_mode_command_replay(amf_ue_t *amf_ue);
++int nas_5gs_send_security_mode_command_protected(amf_ue_t *amf_ue);
++int nas_5gs_send_security_mode_command_plain_text(amf_ue_t *amf_ue);
++int nas_5gs_send_security_mode_command_null_security_int(amf_ue_t *amf_ue);
+ 
+ int nas_5gs_send_configuration_update_command(
+         amf_ue_t *amf_ue, gmm_configuration_update_command_param_t *param);
++int nas_5gs_send_configuration_update_command_plain_text(
++        amf_ue_t *amf_ue, gmm_configuration_update_command_param_t *param);
++int nas_5gs_send_configuration_update_command_replay(
++        amf_ue_t *amf_ue, gmm_configuration_update_command_param_t *param);
++
++int nas_5gs_send_registration_accept_dlnas(amf_ue_t *amf_ue);
++int nas_5gs_send_registration_accept_plain_text_dlnas(amf_ue_t *amf_ue);
++int nas_5gs_send_registration_accept_h4_plain_text_dlnas(amf_ue_t *amf_ue);
++
++int nas_5gs_send_de_registration_request_plain_text(amf_ue_t *amf_ue);
+ 
+ int nas_send_pdu_session_setup_request(amf_sess_t *sess,
+         ogs_pkbuf_t *n1smbuf, ogs_pkbuf_t *n2smbuf);
+diff --git a/src/amf/nas-security.c b/src/amf/nas-security.c
+--- a/src/amf/nas-security.c
++++ b/src/amf/nas-security.c
+@@ -115,6 +115,123 @@
+     return new;
+ }
+ 
++/* Encode with the security header type from the message but force no MAC and
++ * no ciphering — used to send messages with a non-plain security header type
++ * but without actually applying keys (fuzzing / plain-text variants). */
++ogs_pkbuf_t *nas_5gs_security_encode_null_security(
++        amf_ue_t *amf_ue, ogs_nas_5gs_message_t *message)
++{
++    ogs_nas_5gs_security_header_t h;
++    ogs_pkbuf_t *new = NULL;
++
++    ogs_assert(amf_ue);
++    ogs_assert(message);
++
++    if (message->h.security_header_type ==
++            OGS_NAS_SECURITY_HEADER_PLAIN_NAS_MESSAGE)
++        return ogs_nas_5gs_plain_encode(message);
++
++    memset(&h, 0, sizeof(h));
++    h.security_header_type = message->h.security_header_type;
++    h.extended_protocol_discriminator =
++            message->h.extended_protocol_discriminator;
++    h.sequence_number = (amf_ue->dl_count & 0xff);
++
++    new = ogs_nas_5gs_plain_encode(message);
++    if (!new) {
++        ogs_error("ogs_nas_5gs_plain_encode() failed");
++        return NULL;
++    }
++
++    /* encode sequence number (no MAC, no cipher) */
++    ogs_assert(ogs_pkbuf_push(new, 1));
++    *(uint8_t *)(new->data) = h.sequence_number;
++
++    amf_ue->dl_count = (amf_ue->dl_count + 1) & 0xffffff;
++
++    ogs_assert(ogs_pkbuf_push(new, 6));
++    memcpy(new->data, &h, sizeof(ogs_nas_5gs_security_header_t));
++
++    amf_ue->security_context_available = 1;
++    return new;
++}
++
++/* Encode using a previously saved sequence number (replay attack). */
++ogs_pkbuf_t *nas_5gs_security_encode_replay(
++        amf_ue_t *amf_ue, ogs_nas_5gs_message_t *message,
++        int replay_seq)
++{
++    int integrity_protected = 0;
++    int ciphered = 0;
++    ogs_nas_5gs_security_header_t h;
++    ogs_pkbuf_t *new = NULL;
++
++    ogs_assert(amf_ue);
++    ogs_assert(message);
++
++    switch (message->h.security_header_type) {
++    case OGS_NAS_SECURITY_HEADER_PLAIN_NAS_MESSAGE:
++        return ogs_nas_5gs_plain_encode(message);
++    case OGS_NAS_SECURITY_HEADER_INTEGRITY_PROTECTED:
++        integrity_protected = 1;
++        break;
++    case OGS_NAS_SECURITY_HEADER_INTEGRITY_PROTECTED_AND_CIPHERED:
++        integrity_protected = 1;
++        ciphered = 1;
++        break;
++    case OGS_NAS_SECURITY_HEADER_INTEGRITY_PROTECTED_AND_NEW_SECURITY_CONTEXT:
++        integrity_protected = 1;
++        break;
++    case OGS_NAS_SECURITY_HEADER_INTEGRITY_PROTECTED_AND_CIPHTERD_WITH_NEW_INTEGRITY_CONTEXT:
++        integrity_protected = 1;
++        ciphered = 1;
++        break;
++    default:
++        ogs_error("Not implemented(security header type:0x%x)",
++                message->h.security_header_type);
++        return NULL;
++    }
++
++    if (amf_ue->selected_enc_algorithm == 0) ciphered = 0;
++    if (amf_ue->selected_int_algorithm == 0) integrity_protected = 0;
++
++    memset(&h, 0, sizeof(h));
++    h.security_header_type = message->h.security_header_type;
++    h.extended_protocol_discriminator =
++            message->h.extended_protocol_discriminator;
++    h.sequence_number = (uint8_t)replay_seq;
++
++    new = ogs_nas_5gs_plain_encode(message);
++    if (!new) {
++        ogs_error("ogs_nas_5gs_plain_encode() failed");
++        return NULL;
++    }
++
++    if (ciphered) {
++        ogs_nas_encrypt(amf_ue->selected_enc_algorithm,
++                amf_ue->knas_enc, (uint32_t)replay_seq,
++                amf_ue->nas.access_type,
++                OGS_NAS_SECURITY_DOWNLINK_DIRECTION, new);
++    }
++
++    ogs_assert(ogs_pkbuf_push(new, 1));
++    *(uint8_t *)(new->data) = h.sequence_number;
++
++    if (integrity_protected) {
++        uint8_t mac[NAS_SECURITY_MAC_SIZE];
++        ogs_nas_mac_calculate(amf_ue->selected_int_algorithm,
++                amf_ue->knas_int, (uint32_t)replay_seq,
++                amf_ue->nas.access_type,
++                OGS_NAS_SECURITY_DOWNLINK_DIRECTION, new, mac);
++        memcpy(&h.message_authentication_code, mac, sizeof(mac));
++    }
++
++    ogs_assert(ogs_pkbuf_push(new, 6));
++    memcpy(new->data, &h, sizeof(ogs_nas_5gs_security_header_t));
++
++    return new;
++}
++
+ int nas_5gs_security_decode(amf_ue_t *amf_ue,
+     ogs_nas_security_header_type_t security_header_type, ogs_pkbuf_t *pkbuf)
+ {
+diff --git a/src/amf/nas-security.h b/src/amf/nas-security.h
+--- a/src/amf/nas-security.h
++++ b/src/amf/nas-security.h
+@@ -29,7 +29,11 @@
+ 
+ ogs_pkbuf_t *nas_5gs_security_encode(
+     amf_ue_t *amf_ue, ogs_nas_5gs_message_t *message);
+-int nas_5gs_security_decode(amf_ue_t *amf_ue, 
++ogs_pkbuf_t *nas_5gs_security_encode_null_security(
++    amf_ue_t *amf_ue, ogs_nas_5gs_message_t *message);
++ogs_pkbuf_t *nas_5gs_security_encode_replay(
++    amf_ue_t *amf_ue, ogs_nas_5gs_message_t *message, int replay_seq);
++int nas_5gs_security_decode(amf_ue_t *amf_ue,
+     ogs_nas_security_header_type_t security_header_type, ogs_pkbuf_t *pkbuf);
+ 
+ #ifdef __cplusplus
+diff --git a/src/main.c b/src/main.c
+--- a/src/main.c
++++ b/src/main.c
+@@ -75,8 +75,7 @@
+         break;
+ 
+     default:
+-        ogs_error("Signal-NUM[%d] received (%s)",
+-                signum, ogs_signal_description_get(signum));
++        // ogs_error("Signal-NUM[%d] received (%s)", signum, ogs_signal_description_get(signum)); // come back here
+         break;
+             
+     }
+diff --git a/src/amf/amf-socket.c b/src/amf/amf-socket.c
+new file mode 100644
+--- /dev/null
++++ b/src/amf/amf-socket.c
+@@ -0,0 +1,461 @@
++#include <arpa/inet.h>
++#include <netinet/in.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/socket.h>
++#include <unistd.h>
++#include <pthread.h>
++#include <time.h>
++
++#include "amf-sm.h"
++#include "amf-socket.h"
++#include "gmm-build.h"
++#include "gmm-handler.h"
++#include "nas-path.h"
++#include "context.h"
++#include "nausf-build.h"
++#include "nausf-handler.h"
++#include "nudm-build.h"
++#include "sbi-path.h"
++#include "ogs-sbi.h"
++
++#define PORT 60000
++
++int    server_sock  = 0;
++int    auth_count   = 0;
++
++pthread_cond_t  auth_cond           = PTHREAD_COND_INITIALIZER;
++pthread_mutex_t auth_cond_mutex     = PTHREAD_MUTEX_INITIALIZER;
++pthread_cond_t  send_auth_cond      = PTHREAD_COND_INITIALIZER;
++pthread_mutex_t send_auth_cond_mutex = PTHREAD_MUTEX_INITIALIZER;
++
++/* Flag for amf-sm.c: 1 while the socket thread is actively waiting
++ * for an AUSF response and intends to drive the NAS Auth Request
++ * itself. If 0 when amf-sm.c receives the AUSF response, the socket
++ * already timed out / moved on, so amf-sm.c must dispatch normally
++ * instead of blocking on send_auth_cond. */
++volatile int socket_waiting_for_auth = 0;
++volatile struct amf_event_s *event_auth = NULL;
++
++/* ---------- key-availability helpers ----------------------------------- */
++
++static bool check_kamf(uint8_t *kamf)
++{
++    int i;
++    for (i = 0; i < OGS_SHA256_DIGEST_SIZE; i++)
++        if (kamf[i] != 0) return true;
++    return false;
++}
++
++static bool check_int(uint8_t *intarr)
++{
++    int i;
++    for (i = 0; i < OGS_SHA256_DIGEST_SIZE / 2; i++)
++        if (intarr[i] != 0) return true;
++    return false;
++}
++
++static bool check_enc(uint8_t *encarr)
++{
++    int i;
++    for (i = 0; i < OGS_SHA256_DIGEST_SIZE / 2; i++)
++        if (encarr[i] != 0) return true;
++    return false;
++}
++
++static bool check_int_and_enc(uint8_t *intarr, uint8_t *encarr)
++{
++    return check_int(intarr) && check_enc(encarr);
++}
++
++static bool check_kgnb(uint8_t *kgnb)
++{
++    int i;
++    for (i = 0; i < OGS_SHA256_DIGEST_SIZE; i++)
++        if (kgnb[i] != 0) return true;
++    return false;
++}
++
++/* ---------- main socket thread ----------------------------------------- */
++
++void *conn(void *arg)
++{
++    struct sockaddr_in serv_addr;
++    int opt = 1, addrlen = sizeof(serv_addr), valread, server_fd;
++    int smd_replayed = 0, conf_upd_replayed = 0;
++
++    if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
++        perror("socket failed");
++        exit(EXIT_FAILURE);
++    }
++    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt))) {
++        perror("setsockopt");
++        exit(EXIT_FAILURE);
++    }
++
++    serv_addr.sin_family      = AF_INET;
++    serv_addr.sin_addr.s_addr = INADDR_ANY;
++    serv_addr.sin_port        = htons(PORT);
++    if (inet_pton(AF_INET, "127.0.0.1", &serv_addr.sin_addr) <= 0) {
++        printf("Invalid address / Address not supported\n");
++        return NULL;
++    }
++    if (bind(server_fd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
++        perror("bind failed");
++        exit(EXIT_FAILURE);
++    }
++    if (listen(server_fd, 3) < 0) {
++        perror("listen");
++        exit(EXIT_FAILURE);
++    }
++
++    printf("[amf-socket] waiting for testing client on 127.0.0.1:%d ...\n", PORT);
++    fflush(stdout);
++
++    if ((server_sock = accept(server_fd, (struct sockaddr *)&serv_addr,
++                              (socklen_t *)&addrlen)) < 0) {
++        perror("accept");
++        exit(EXIT_FAILURE);
++    }
++
++    printf("[amf-socket] testing client connected (fd=%d)\n", server_sock);
++    fflush(stdout);
++    ogs_info("[amf-socket] testing client connected");
++
++    /* Hello handshake */
++    char test_buffer[1024] = {0};
++    valread = read(server_sock, test_buffer, sizeof(test_buffer) - 1);
++    ogs_info("[amf-socket] handshake: %s", test_buffer);
++    send_message("ACK from core\n");
++
++    while (1) {
++        char buffer[1024] = {0};
++        valread = read(server_sock, buffer, sizeof(buffer) - 1);
++        if (valread <= 0) {
++            printf("[amf-socket] testing client disconnected\n");
++            fflush(stdout);
++            break;
++        }
++
++        amf_ue_t *amf_ue  = ogs_list_first(&amf_self()->amf_ue_list);
++        ran_ue_t *ran_ue  = amf_ue ? ran_ue_find_by_id(amf_ue->ran_ue_id) : NULL;
++
++        ogs_info("[amf-socket] received: %s", buffer);
++
++        /* ---- reset counter ---- */
++        if (strcmp(buffer, "RACH_Reset\n") == 0) {
++            ogs_warn("[amf-socket] RACH_Reset");
++            regis_count = 0;
++            send_message("DONE\n");
++            continue;
++        }
++
++        /* ---- guard: UE must not have reconnected ---- */
++        if (regis_count > 1) {
++            ogs_warn("[amf-socket] regis_count > 1, sending null_action");
++            send_message("null_action\n");
++            continue;
++        }
++
++        if (!amf_ue) {
++            ogs_error("[amf-socket] no amf_ue, sending null_action");
++            send_message("null_action\n");
++            continue;
++        }
++
++        /* ====== NAS identity request ====== */
++        if (strcmp(buffer, "id_request\n") == 0) {
++            ogs_info("[amf-socket] id_request_plain_text");
++            CLEAR_AMF_UE_TIMER(amf_ue->t3570);
++            nas_5gs_send_identity_request(amf_ue);
++        }
++
++        /* ====== Authentication request (plain text) ======
++         * Active hook (5GBaseChecker style): trigger the AUSF
++         * Authenticate POST, block on auth_cond until amf-sm.c sees
++         * the AUSF response, then synchronously process the auth
++         * vector (which sends NAS Authentication Request to the UE).
++         * Finally signal send_auth_cond so amf-sm.c can resume; the
++         * intercept block there skips its own dispatch so the UE
++         * doesn't get a duplicate Auth Request. */
++        else if (strcmp(buffer, "auth_request_plain_text\n") == 0) {
++            ogs_info("[amf-socket] auth_request_plain_text (active)");
++            printf("[amf-socket] >>> auth_request_plain_text: queueing AUSF POST\n");
++            fflush(stdout);
++            auth_count = 0;
++            event_auth = NULL;
++            socket_waiting_for_auth = 1;
++
++            int sbi_rv = amf_ue_sbi_discover_and_send(
++                    OGS_SBI_SERVICE_TYPE_NAUSF_AUTH, NULL,
++                    amf_nausf_auth_build_authenticate, amf_ue, 0, NULL);
++            if (sbi_rv != OGS_OK) {
++                printf("[amf-socket] !!! AUSF discover_and_send failed (%d)\n",
++                        sbi_rv);
++                fflush(stdout);
++                socket_waiting_for_auth = 0;
++                send_message("null_action\n");
++                continue;
++            }
++
++            /* Wait up to 15s for amf-sm.c to signal the AUSF response.
++             * The first AUSF call after AMF startup includes NRF
++             * discovery which can take 7+ seconds on a cold cache. */
++            struct timespec ts;
++            clock_gettime(CLOCK_REALTIME, &ts);
++            ts.tv_sec += 15;
++            pthread_mutex_lock(&auth_cond_mutex);
++            int wait_rv = 0;
++            while (event_auth == NULL && wait_rv == 0) {
++                wait_rv = pthread_cond_timedwait(&auth_cond,
++                        &auth_cond_mutex, &ts);
++            }
++            pthread_mutex_unlock(&auth_cond_mutex);
++
++            /* Mark ourselves as no longer waiting BEFORE checking the
++             * outcome — so if amf-sm.c arrives just after our timeout,
++             * it sees socket_waiting_for_auth == 0 and dispatches
++             * normally instead of deadlocking on send_auth_cond. */
++            socket_waiting_for_auth = 0;
++
++            if (wait_rv != 0 || event_auth == NULL) {
++                printf("[amf-socket] !!! AUSF response timed out (rv=%d). "
++                       "Possible cause: SBI call from non-event-loop thread "
++                       "did not fire, or AUSF/UDM unreachable.\n", wait_rv);
++                fflush(stdout);
++                /* If amf-sm.c is somehow already blocked, unblock it. */
++                pthread_mutex_lock(&send_auth_cond_mutex);
++                pthread_cond_signal(&send_auth_cond);
++                pthread_mutex_unlock(&send_auth_cond_mutex);
++                send_message("null_action\n");
++                continue;
++            }
++
++            printf("[amf-socket] <<< AUSF response received, processing\n");
++            fflush(stdout);
++
++            /* Process the auth vector and send Auth Request to UE. */
++            ogs_sbi_message_t *auth_msg =
++                (ogs_sbi_message_t *)event_auth->h.sbi.message;
++            amf_nausf_auth_handle_authenticate(amf_ue, auth_msg);
++
++            /* Tell amf-sm.c to resume (it will skip its own dispatch). */
++            pthread_mutex_lock(&send_auth_cond_mutex);
++            pthread_cond_signal(&send_auth_cond);
++            pthread_mutex_unlock(&send_auth_cond_mutex);
++
++            printf("[amf-socket] === Auth Request sent to UE, awaiting response\n");
++            fflush(stdout);
++        }
++
++        /* ====== Authentication reject ====== */
++        else if (strcmp(buffer, "auth_reject\n") == 0) {
++            ogs_info("[amf-socket] auth_reject");
++            nas_5gs_send_authentication_reject(amf_ue);
++        }
++
++        /* ====== Security mode command (plain) ======
++         * Semi-passive: actively sends NAS Security Mode Command to the
++         * UE; gmm-handler.c emits "nas_sm_complete" to the socket when
++         * the UE replies. (Was previously a no-op that relied on the
++         * auto-NAS-SMC fire from gmm_state_security_mode ENTRY; that
++         * auto-fire is now suppressed in gmm-sm.c.) */
++        else if (strcmp(buffer, "nas_sm_cmd\n") == 0) {
++            ogs_info("[amf-socket] nas_sm_cmd");
++            if (!check_kamf(amf_ue->kamf)) {
++                ogs_info("[amf-socket] no kamf for nas_sm_cmd");
++                send_message("null_action\n");
++                continue;
++            }
++            int rv = nas_5gs_send_security_mode_command(amf_ue);
++            if (rv != OGS_OK) {
++                ogs_info("[amf-socket] nas_sm_cmd failed");
++                send_message("null_action\n");
++                continue;
++            }
++            smd_replayed = 1;
++        }
++
++        /* ====== Security mode command – int+enc protected ====== */
++        else if (strcmp(buffer, "nas_sm_cmd_protected\n") == 0) {
++            ogs_info("[amf-socket] nas_sm_cmd_protected");
++            if (!check_int_and_enc(amf_ue->knas_int, amf_ue->knas_enc)) {
++                ogs_info("[amf-socket] no int/enc keys for smd_protected");
++                send_message("null_action\n");
++                continue;
++            }
++            int rv = nas_5gs_send_security_mode_command_protected(amf_ue);
++            if (rv != OGS_OK) {
++                ogs_info("[amf-socket] smd_protected failed");
++                send_message("null_action\n");
++                continue;
++            }
++        }
++
++        /* ====== Security mode command replay ====== */
++        else if (strcmp(buffer, "nas_sm_cmd_replay\n") == 0) {
++            ogs_info("[amf-socket] nas_sm_cmd_replay");
++            if (!smd_replayed) {
++                ogs_info("[amf-socket] no prior smd to replay");
++                send_message("null_action\n");
++                continue;
++            }
++            if (!check_int(amf_ue->knas_int)) {
++                ogs_info("[amf-socket] no integrity key for smd_replay");
++                send_message("null_action\n");
++                continue;
++            }
++            nas_5gs_send_security_mode_command_replay(amf_ue);
++        }
++
++        /* ====== Security mode command – null security plain text ====== */
++        else if (strcmp(buffer, "nas_sm_cmd_ns_plain_text\n") == 0) {
++            ogs_info("[amf-socket] nas_sm_cmd_ns_plain_text");
++            nas_5gs_send_security_mode_command_plain_text(amf_ue);
++        }
++
++        /* ====== Security mode command – null security, int protected ====== */
++        else if (strcmp(buffer, "nas_sm_cmd_ns\n") == 0) {
++            ogs_info("[amf-socket] nas_sm_cmd_ns");
++            if (!check_kamf(amf_ue->kamf)) {
++                ogs_info("[amf-socket] no kamf for smd_ns");
++                send_message("null_action\n");
++                continue;
++            }
++            int rv = nas_5gs_send_security_mode_command_null_security_int(amf_ue);
++            if (rv != OGS_OK) {
++                send_message("null_action\n");
++                continue;
++            }
++        }
++
++        /* ====== Registration accept – protected ====== */
++        else if (strcmp(buffer, "registration_accept_protected\n") == 0) {
++            if (!check_kgnb(amf_ue->kgnb)) {
++                ogs_info("[amf-socket] no kgnb for protected reg_accept");
++                send_message("null_action\n");
++                continue;
++            }
++            amf_ue_sbi_discover_and_send(
++                    OGS_SBI_SERVICE_TYPE_NUDM_UECM, NULL,
++                    amf_nudm_uecm_build_registration, amf_ue, 0, NULL);
++            ogs_info("[amf-socket] registration_accept_protected");
++            nas_5gs_send_registration_accept_dlnas(amf_ue);
++        }
++
++        /* ====== Registration accept – plain text ====== */
++        else if (strcmp(buffer, "registration_accept_plain_text\n") == 0) {
++            amf_ue_sbi_discover_and_send(
++                    OGS_SBI_SERVICE_TYPE_NUDM_UECM, NULL,
++                    amf_nudm_uecm_build_registration, amf_ue, 0, NULL);
++            ogs_info("[amf-socket] registration_accept_plain_text");
++            nas_5gs_send_registration_accept_plain_text_dlnas(amf_ue);
++        }
++
++        /* ====== Registration accept – header-4 plain text ====== */
++        else if (strcmp(buffer, "registration_accept_h4_plain_text\n") == 0) {
++            amf_ue_sbi_discover_and_send(
++                    OGS_SBI_SERVICE_TYPE_NUDM_UECM, NULL,
++                    amf_nudm_uecm_build_registration, amf_ue, 0, NULL);
++            ogs_info("[amf-socket] registration_accept_h4_plain_text");
++            nas_5gs_send_registration_accept_h4_plain_text_dlnas(amf_ue);
++        }
++
++        /* ====== Configuration update command – protected ====== */
++        else if (strcmp(buffer, "config_update_cmd_protected\n") == 0) {
++            ogs_info("[amf-socket] config_update_cmd_protected");
++            if (!check_int_and_enc(amf_ue->knas_int, amf_ue->knas_enc)) {
++                ogs_info("[amf-socket] no int/enc keys for config_update_protected");
++                send_message("null_action\n");
++                continue;
++            }
++            gmm_configuration_update_command_param_t param;
++            memset(&param, 0, sizeof(param));
++            param.nitz = 1;
++            nas_5gs_send_configuration_update_command(amf_ue, &param);
++            conf_upd_replayed = 1;
++        }
++
++        /* ====== Configuration update command – plain text ====== */
++        else if (strcmp(buffer, "config_update_cmd_plain_text\n") == 0) {
++            ogs_info("[amf-socket] config_update_cmd_plain_text");
++            gmm_configuration_update_command_param_t param;
++            memset(&param, 0, sizeof(param));
++            param.nitz = 1;
++            nas_5gs_send_configuration_update_command_plain_text(amf_ue, &param);
++        }
++
++        /* ====== Configuration update command replay ====== */
++        else if (strcmp(buffer, "config_update_cmd_replay\n") == 0) {
++            ogs_info("[amf-socket] config_update_cmd_replay");
++            if (!check_int_and_enc(amf_ue->knas_int, amf_ue->knas_enc)) {
++                ogs_info("[amf-socket] no int/enc keys for config_update_replay");
++                send_message("null_action\n");
++                continue;
++            }
++            if (!conf_upd_replayed) {
++                ogs_info("[amf-socket] no prior config_update to replay");
++                send_message("null_action\n");
++                continue;
++            }
++            gmm_configuration_update_command_param_t param;
++            memset(&param, 0, sizeof(param));
++            param.nitz = 1;
++            nas_5gs_send_configuration_update_command_replay(amf_ue, &param);
++        }
++
++        /* ====== Registration reject ====== */
++        else if (strcmp(buffer, "registration_reject\n") == 0) {
++            ogs_info("[amf-socket] registration_reject");
++            if (!ran_ue) {
++                send_message("null_action\n");
++                continue;
++            }
++            nas_5gs_send_registration_reject(ran_ue, amf_ue,
++                    OGS_5GMM_CAUSE_PLMN_NOT_ALLOWED);
++            amf_sbi_send_release_all_sessions(
++                    ran_ue, amf_ue, AMF_RELEASE_SM_CONTEXT_NO_STATE, NULL);
++        }
++
++        /* ====== Deregistration request – protected ====== */
++        else if (strcmp(buffer, "deregistration_req_protected\n") == 0) {
++            ogs_info("[amf-socket] deregistration_req_protected");
++            if (!check_int_and_enc(amf_ue->knas_int, amf_ue->knas_enc)) {
++                ogs_info("[amf-socket] no int/enc keys for dereg_protected");
++                send_message("null_action\n");
++                continue;
++            }
++            nas_5gs_send_de_registration_request(
++                    amf_ue, OpenAPI_deregistration_reason_NULL, 0);
++        }
++
++        /* ====== Deregistration request – plain text ====== */
++        else if (strcmp(buffer, "deregistration_req_plain_text\n") == 0) {
++            ogs_info("[amf-socket] deregistration_req_plain_text");
++            nas_5gs_send_de_registration_request_plain_text(amf_ue);
++        }
++
++        /* ====== end session ====== */
++        else if (strcmp(buffer, "end") == 0) {
++            printf("[amf-socket] received end\n");
++            break;
++        }
++    }
++
++    return NULL;
++}
++
++/* ---- thread launcher -------------------------------------------------- */
++
++void thr_connect(void)
++{
++    pthread_t thr;
++    int ret = pthread_create(&thr, NULL, conn, NULL);
++    if (ret != 0) {
++        ogs_error("[amf-socket] pthread_create failed");
++        printf("[amf-socket] create thread error\n");
++        return;
++    }
++    ogs_info("[amf-socket] socket thread created");
++}
+diff --git a/src/amf/amf-socket.h b/src/amf/amf-socket.h
+new file mode 100644
+--- /dev/null
++++ b/src/amf/amf-socket.h
+@@ -0,0 +1,29 @@
++#ifndef OPEN5GS_AMF_SOCKET_H
++#define OPEN5GS_AMF_SOCKET_H
++
++#include <pthread.h>
++#include <stdbool.h>
++#include <stdint.h>
++
++extern int server_sock;
++
++/* auth-interception synchronisation */
++extern int auth_count;
++extern pthread_cond_t  auth_cond;
++extern pthread_mutex_t auth_cond_mutex;
++extern pthread_cond_t  send_auth_cond;
++extern pthread_mutex_t send_auth_cond_mutex;
++
++/* captured SBI auth event (set in amf-sm.c before signalling) */
++struct amf_event_s;
++extern volatile struct amf_event_s *event_auth;
++
++/* socket thread sets this to 1 while actively waiting for AUSF response;
++ * amf-sm.c reads it to decide whether to block on send_auth_cond */
++extern volatile int socket_waiting_for_auth;
++
++void  send_message(const char *message);
++void *conn(void *arg);
++void  thr_connect(void);
++
++#endif /* OPEN5GS_AMF_SOCKET_H */
