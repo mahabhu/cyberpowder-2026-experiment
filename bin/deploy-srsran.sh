@@ -35,6 +35,7 @@ cd $SRCDIR
 git clone $SRS_PROJECT_REPO
 cd srsRAN_Project
 git checkout $COMMIT_HASH
+git apply $ETCDIR/srsran/srsran.patch
 mkdir build
 cd build
 cmake ../
