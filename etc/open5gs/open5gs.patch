@@ -1538,7 +1538,7 @@ diff --git a/src/amf/amf-socket.c b/src/amf/amf-socket.c
 new file mode 100644
 --- /dev/null
 +++ b/src/amf/amf-socket.c
-@@ -0,0 +1,477 @@
+@@ -0,0 +1,537 @@
 +#include <arpa/inet.h>
 +#include <netinet/in.h>
 +#include <stdio.h>
@@ -1809,7 +1809,12 @@ new file mode 100644
 +        /* ====== Authentication reject ====== */
 +        else if (strcmp(buffer, "auth_reject\n") == 0) {
 +            ogs_info("[amf-socket] auth_reject");
-+            nas_5gs_send_authentication_reject(amf_ue);
++            int rv = nas_5gs_send_authentication_reject(amf_ue);
++            if (rv != OGS_OK) {
++                ogs_info("[amf-socket] auth_reject failed");
++                send_message("null_action\n");
++                continue;
++            }
 +        }
 +
 +        /* ====== Security mode command (plain) ======
@@ -1863,13 +1868,23 @@ new file mode 100644
 +                send_message("null_action\n");
 +                continue;
 +            }
-+            nas_5gs_send_security_mode_command_replay(amf_ue);
++            int rv = nas_5gs_send_security_mode_command_replay(amf_ue);
++            if (rv != OGS_OK) {
++                ogs_info("[amf-socket] nas_sm_cmd_replay failed");
++                send_message("null_action\n");
++                continue;
++            }
 +        }
 +
 +        /* ====== Security mode command – null security plain text ====== */
 +        else if (strcmp(buffer, "nas_sm_cmd_ns_plain_text\n") == 0) {
 +            ogs_info("[amf-socket] nas_sm_cmd_ns_plain_text");
-+            nas_5gs_send_security_mode_command_plain_text(amf_ue);
++            int rv = nas_5gs_send_security_mode_command_plain_text(amf_ue);
++            if (rv != OGS_OK) {
++                ogs_info("[amf-socket] nas_sm_cmd_ns_plain_text failed");
++                send_message("null_action\n");
++                continue;
++            }
 +        }
 +
 +        /* ====== Security mode command – null security, int protected ====== */
@@ -1898,7 +1913,12 @@ new file mode 100644
 +                    OGS_SBI_SERVICE_TYPE_NUDM_UECM, NULL,
 +                    amf_nudm_uecm_build_registration, amf_ue, 0, NULL);
 +            ogs_info("[amf-socket] registration_accept_protected");
-+            nas_5gs_send_registration_accept_dlnas(amf_ue);
++            int rv = nas_5gs_send_registration_accept_dlnas(amf_ue);
++            if (rv != OGS_OK) {
++                ogs_info("[amf-socket] registration_accept_protected failed");
++                send_message("null_action\n");
++                continue;
++            }
 +        }
 +
 +        /* ====== Registration accept – plain text ====== */
@@ -1907,7 +1927,12 @@ new file mode 100644
 +                    OGS_SBI_SERVICE_TYPE_NUDM_UECM, NULL,
 +                    amf_nudm_uecm_build_registration, amf_ue, 0, NULL);
 +            ogs_info("[amf-socket] registration_accept_plain_text");
-+            nas_5gs_send_registration_accept_plain_text_dlnas(amf_ue);
++            int rv = nas_5gs_send_registration_accept_plain_text_dlnas(amf_ue);
++            if (rv != OGS_OK) {
++                ogs_info("[amf-socket] registration_accept_plain_text failed");
++                send_message("null_action\n");
++                continue;
++            }
 +        }
 +
 +        /* ====== Registration accept – header-4 plain text ====== */
@@ -1916,7 +1941,12 @@ new file mode 100644
 +                    OGS_SBI_SERVICE_TYPE_NUDM_UECM, NULL,
 +                    amf_nudm_uecm_build_registration, amf_ue, 0, NULL);
 +            ogs_info("[amf-socket] registration_accept_h4_plain_text");
-+            nas_5gs_send_registration_accept_h4_plain_text_dlnas(amf_ue);
++            int rv = nas_5gs_send_registration_accept_h4_plain_text_dlnas(amf_ue);
++            if (rv != OGS_OK) {
++                ogs_info("[amf-socket] registration_accept_h4_plain_text failed");
++                send_message("null_action\n");
++                continue;
++            }
 +        }
 +
 +        /* ====== Configuration update command – protected ====== */
@@ -1930,7 +1960,12 @@ new file mode 100644
 +            gmm_configuration_update_command_param_t param;
 +            memset(&param, 0, sizeof(param));
 +            param.nitz = 1;
-+            nas_5gs_send_configuration_update_command(amf_ue, &param);
++            int rv = nas_5gs_send_configuration_update_command(amf_ue, &param);
++            if (rv != OGS_OK) {
++                ogs_info("[amf-socket] config_update_cmd_protected failed");
++                send_message("null_action\n");
++                continue;
++            }
 +            conf_upd_replayed = 1;
 +        }
 +
@@ -1940,7 +1975,12 @@ new file mode 100644
 +            gmm_configuration_update_command_param_t param;
 +            memset(&param, 0, sizeof(param));
 +            param.nitz = 1;
-+            nas_5gs_send_configuration_update_command_plain_text(amf_ue, &param);
++            int rv = nas_5gs_send_configuration_update_command_plain_text(amf_ue, &param);
++            if (rv != OGS_OK) {
++                ogs_info("[amf-socket] config_update_cmd_plain_text failed");
++                send_message("null_action\n");
++                continue;
++            }
 +        }
 +
 +        /* ====== Configuration update command replay ====== */
@@ -1959,7 +1999,12 @@ new file mode 100644
 +            gmm_configuration_update_command_param_t param;
 +            memset(&param, 0, sizeof(param));
 +            param.nitz = 1;
-+            nas_5gs_send_configuration_update_command_replay(amf_ue, &param);
++            int rv = nas_5gs_send_configuration_update_command_replay(amf_ue, &param);
++            if (rv != OGS_OK) {
++                ogs_info("[amf-socket] config_update_cmd_replay failed");
++                send_message("null_action\n");
++                continue;
++            }
 +        }
 +
 +        /* ====== Registration reject ====== */
@@ -1969,8 +2014,13 @@ new file mode 100644
 +                send_message("null_action\n");
 +                continue;
 +            }
-+            nas_5gs_send_registration_reject(ran_ue, amf_ue,
++            int rv = nas_5gs_send_registration_reject(ran_ue, amf_ue,
 +                    OGS_5GMM_CAUSE_PLMN_NOT_ALLOWED);
++            if (rv != OGS_OK) {
++                ogs_info("[amf-socket] registration_reject failed");
++                send_message("null_action\n");
++                continue;
++            }
 +            amf_sbi_send_release_all_sessions(
 +                    ran_ue, amf_ue, AMF_RELEASE_SM_CONTEXT_NO_STATE, NULL);
 +        }
@@ -1983,14 +2033,24 @@ new file mode 100644
 +                send_message("null_action\n");
 +                continue;
 +            }
-+            nas_5gs_send_de_registration_request(
++            int rv = nas_5gs_send_de_registration_request(
 +                    amf_ue, OpenAPI_deregistration_reason_NULL, 0);
++            if (rv != OGS_OK) {
++                ogs_info("[amf-socket] deregistration_req_protected failed");
++                send_message("null_action\n");
++                continue;
++            }
 +        }
 +
 +        /* ====== Deregistration request – plain text ====== */
 +        else if (strcmp(buffer, "deregistration_req_plain_text\n") == 0) {
 +            ogs_info("[amf-socket] deregistration_req_plain_text");
-+            nas_5gs_send_de_registration_request_plain_text(amf_ue);
++            int rv = nas_5gs_send_de_registration_request_plain_text(amf_ue);
++            if (rv != OGS_OK) {
++                ogs_info("[amf-socket] deregistration_req_plain_text failed");
++                send_message("null_action\n");
++                continue;
++            }
 +        }
 +
 +        /* ====== end session ====== */
